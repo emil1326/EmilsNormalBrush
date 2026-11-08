@@ -16,6 +16,11 @@ def overwriting_modifiers(obj):
     return found
 
 
+def overwriting_modifiers_all(objs):
+    """'Object: Modifier' for every overwriting modifier on the given objects."""
+    return [f"{ob.name}: {name}" for ob in objs for name in overwriting_modifiers(ob)]
+
+
 def draw_props(layout, settings):
     layout.prop(settings, "radius")
     layout.prop(settings, "strength")
@@ -42,8 +47,8 @@ class EMILSNB_PT_main(bpy.types.Panel):
         row.operator("emils.normal_brush_toggle", text="Stop Brush" if on else "Start Brush",
                      icon="PAUSE" if on else "PLAY", depress=on)
         draw_props(layout, context.scene.emils_normal_brush)
-        for name in overwriting_modifiers(context.active_object):
-            layout.label(text=f"'{name}' overwrites custom normals", icon="ERROR")
+        for name in overwriting_modifiers_all(brush.selected_meshes(context, dedupe=False)):
+            layout.label(text=f"{name} overwrites custom normals", icon="ERROR")
         layout.separator()
         layout.operator("emils.normal_brush_clear", text="Clear Custom Normals")
 

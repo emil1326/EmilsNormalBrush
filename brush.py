@@ -53,59 +53,115 @@ def mesh_edges(mesh):
     return ev.reshape(-1, 2)
 
 
-def auto_blur_distance(obj):
-    return 2.5 * core.mean_edge_length(world_positions(obj), mesh_edges(obj.data))
+def unique_by_data(objs):
+    """Keep the first object of each mesh datablock (linked duplicates share one)."""
+    seen, out = set(), []
+    for ob in objs:
+        if ob.data.as_pointer() not in seen:
+            seen.add(ob.data.as_pointer())
+            out.append(ob)
+    return out
+
+
+def selected_meshes(context, dedupe=True):
+    """Active mesh first (if it is one), then every other selected mesh object."""
+    objs = []
+    active = context.active_object
+    if active is not None and active.type == "MESH":
+        objs.append(active)
+    for ob in context.selected_objects:
+        if ob.type == "MESH" and ob not in objs:
+            objs.append(ob)
+    return unique_by_data(objs) if dedupe else objs
+
+
+def auto_blur_distance(objs):
+    """2.5 x the mean edge length (world space) over one object or a list of them."""
+    if isinstance(objs, bpy.types.Object):
+        objs = [objs]
+    total, count = 0.0, 0
+    for ob in unique_by_data(objs):
+        ev = mesh_edges(ob.data)
+        if len(ev) == 0:
+            continue
+        wp = world_positions(ob)
+        total += float(np.linalg.norm(wp[ev[:, 0]] - wp[ev[:, 1]], axis=1).sum())
+        count += len(ev)
+    return 2.5 * total / count if count else 0.0
 
 
 class Session:
-    """Everything one stroke needs: the numpy state, a BVH to raycast, and the write-back."""
+    """Everything one stroke needs: the numpy state over all objects, one BVH to raycast, the write-back."""
 
-    def __init__(self, obj):
-        self.obj = obj
-        self.mesh = obj.data
-        mesh = self.mesh
-        prepare_mesh(mesh)
-        mesh.calc_normals_split()
-        nloops, nverts = len(mesh.loops), len(mesh.vertices)
-        ln = np.empty(nloops * 3, dtype=np.float32)
-        mesh.loops.foreach_get("normal", ln)
-        lv = np.empty(nloops, dtype=np.int32)
-        mesh.loops.foreach_get("vertex_index", lv)
-        pn = np.empty(nverts * 3, dtype=np.float32)
-        mesh.vertices.foreach_get("normal", pn)
-        self.vw = world_positions(obj)
-        self.state = core.NormalBrushState(self.vw, lv, ln.reshape(-1, 3), pn.reshape(-1, 3), obj.matrix_world)
+    def __init__(self, objs, active=None):
+        if isinstance(objs, bpy.types.Object):
+            objs = [objs]
+        self.objects = [ob for ob in unique_by_data(list(objs)) if len(ob.data.loops) > 0]
+        if not self.objects:
+            raise ValueError("no mesh with faces to paint")
+        slices = []
+        for obj in self.objects:
+            mesh = obj.data
+            prepare_mesh(mesh)
+            mesh.calc_normals_split()
+            nloops, nverts = len(mesh.loops), len(mesh.vertices)
+            ln = np.empty(nloops * 3, dtype=np.float32)
+            mesh.loops.foreach_get("normal", ln)
+            lv = np.empty(nloops, dtype=np.int32)
+            mesh.loops.foreach_get("vertex_index", lv)
+            pn = np.empty(nverts * 3, dtype=np.float32)
+            mesh.vertices.foreach_get("normal", pn)
+            slices.append(core.ObjectNormals(world_positions(obj), lv, ln.reshape(-1, 3), pn.reshape(-1, 3),
+                                             obj.matrix_world))
+        ref = self.objects.index(active) if active in self.objects else 0
+        self.state = core.NormalBrushState(slices, mirror_ref=ref)
+        self.vw = self.state.vw
         self.bvh = self._build_bvh()
-        self.dirty = False
+
+    @property
+    def dirty(self):
+        return any(o.changed for o in self.state.objs)
 
     def _build_bvh(self):
-        mesh = self.mesh
-        mesh.calc_loop_triangles()
-        tris = np.empty(len(mesh.loop_triangles) * 3, dtype=np.int32)
-        mesh.loop_triangles.foreach_get("vertices", tris)
-        return BVHTree.FromPolygons(self.vw.tolist(), tris.reshape(-1, 3).tolist())
+        tris = []
+        for obj, off in zip(self.objects, self.state.offsets):
+            mesh = obj.data
+            mesh.calc_loop_triangles()
+            t = np.empty(len(mesh.loop_triangles) * 3, dtype=np.int32)
+            mesh.loop_triangles.foreach_get("vertices", t)
+            tris.append(t.reshape(-1, 3) + int(off))
+        return BVHTree.FromPolygons(self.vw.tolist(), np.concatenate(tris).tolist())
 
     def raycast(self, origin, direction):
         loc, _normal, _index, _dist = self.bvh.ray_cast(origin, direction)
         return loc
 
     def dab(self, hit_world, world_radius, settings, mode="BLUR"):
-        changed = self.state.dab(hit_world, world_radius, settings.strength, settings.blur_distance,
-                                 mode, settings.mirror_x)
-        self.dirty |= changed
-        return changed
+        return self.state.dab(hit_world, world_radius, settings.strength, settings.blur_distance,
+                              mode, settings.mirror_x)
 
     def write(self):
-        if not self.dirty:
-            return
-        self.mesh.normals_split_custom_set(self.state.ln)
-        self.mesh.update()
-        self.dirty = False
+        """Write every object whose normals changed since the last write."""
+        wrote = False
+        for obj, sl in zip(self.objects, self.state.objs):
+            if not sl.changed:
+                continue
+            obj.data.normals_split_custom_set(sl.ln)
+            obj.data.update()
+            sl.changed = False
+            wrote = True
+        return wrote
 
     def restore_start(self):
+        """Esc: put every object that was touched back to its start normals."""
+        for obj, sl in zip(self.objects, self.state.objs):
+            if not sl.touched:
+                continue
+            sl.reset()
+            obj.data.normals_split_custom_set(sl.ln)
+            obj.data.update()
+            sl.changed = sl.touched = False
         self.state.reset()
-        self.dirty = True
-        self.write()
 
 
 def view_ray(context, coord):
@@ -136,14 +192,14 @@ class EMILSNB_OT_stroke(bpy.types.Operator):
         return context.area is not None and context.area.type == "VIEW_3D" and context.region_data is not None
 
     def invoke(self, context, event):
-        obj = context.active_object
-        if obj is None or obj.type != "MESH" or obj.mode != "OBJECT":
-            self.report({"WARNING"}, "Pick a mesh object and stay in Object Mode")
+        objs = selected_meshes(context)
+        if not objs or context.mode != "OBJECT":
+            self.report({"WARNING"}, "Select a mesh and stay in Object Mode")
             return {"CANCELLED"}
-        if len(obj.data.loops) == 0:
+        if not any(len(ob.data.loops) for ob in objs):
             self.report({"WARNING"}, "The mesh has no faces")
             return {"CANCELLED"}
-        self.session = Session(obj)
+        self.session = Session(objs, active=context.active_object)
         self.last_write = 0.0
         self.last_xy = None
         self._dab_at(context, (event.mouse_region_x, event.mouse_region_y))
@@ -255,15 +311,15 @@ class EMILSNB_OT_adjust(bpy.types.Operator):
 class EMILSNB_OT_auto_distance(bpy.types.Operator):
     bl_idname = "emils.normal_brush_auto_distance"
     bl_label = "Auto Blur Distance"
-    bl_description = "Set the blur distance to about 2.5 times the mean edge length of the active mesh (world space)"
+    bl_description = "Set the blur distance to about 2.5 times the mean edge length of the selected meshes (world space)"
     bl_options = {"REGISTER", "UNDO"}
 
     @classmethod
     def poll(cls, context):
-        return context.active_object is not None and context.active_object.type == "MESH"
+        return bool(selected_meshes(context))
 
     def execute(self, context):
-        value = auto_blur_distance(context.active_object)
+        value = auto_blur_distance(selected_meshes(context))
         if value <= 0:
             self.report({"WARNING"}, "No edges to measure")
             return {"CANCELLED"}
@@ -274,20 +330,21 @@ class EMILSNB_OT_auto_distance(bpy.types.Operator):
 class EMILSNB_OT_clear(bpy.types.Operator):
     bl_idname = "emils.normal_brush_clear"
     bl_label = "Clear Custom Normals"
-    bl_description = "Remove the custom split normals of the active mesh"
+    bl_description = "Remove the custom split normals of every selected mesh"
     bl_options = {"REGISTER", "UNDO"}
 
     @classmethod
     def poll(cls, context):
-        ob = context.active_object
-        return ob is not None and ob.type == "MESH" and ob.mode == "OBJECT"
+        return context.mode == "OBJECT" and bool(selected_meshes(context))
 
     def execute(self, context):
-        ob = context.active_object
-        with context.temp_override(object=ob, active_object=ob, selected_objects=[ob]):
-            result = bpy.ops.mesh.customdata_custom_splitnormals_clear()
+        done = False
+        for ob in selected_meshes(context):
+            with context.temp_override(object=ob, active_object=ob, selected_objects=[ob]):
+                result = bpy.ops.mesh.customdata_custom_splitnormals_clear()
+            done |= "FINISHED" in result
         bump_cache()
-        return {"FINISHED"} if "FINISHED" in result else {"CANCELLED"}
+        return {"FINISHED"} if done else {"CANCELLED"}
 
 
 # ----------------------------------------------------------------- cursor drawing
@@ -340,16 +397,18 @@ def hover_data(obj):
 
 
 def draw_hover_normals(context, cx, cy, radius, settings):
-    obj = context.active_object
     region, rv3d = context.region, context.region_data
     # cx, cy are in whatever space the current viewport uses. Blender hands draw_cursor the mouse in window
     # pixels and the viewport may be the whole window, so shift into region pixels (and back for drawing).
     vp = gpu.state.viewport_get()
     off = np.array([region.x, region.y], dtype=np.float64) if vp[2] > region.width + 1 or vp[3] > region.height + 1         else np.zeros(2)
     cx, cy = cx - off[0], cy - off[1]
-    if obj is None or obj.type != "MESH" or rv3d is None:
+    objs = selected_meshes(context, dedupe=False)
+    if not objs or rv3d is None:
         return
-    pos, nrm = hover_data(obj)
+    data = [hover_data(ob) for ob in objs]
+    pos = np.concatenate([d[0] for d in data])
+    nrm = np.concatenate([d[1] for d in data])
     pm = np.array(rv3d.perspective_matrix, dtype=np.float64)
     size = np.array([region.width, region.height], dtype=np.float64)
 
@@ -405,7 +464,7 @@ class EmilsNormalBrushTool(bpy.types.WorkSpaceTool):
     bl_context_mode = "OBJECT"
     bl_idname = "emils.normal_brush"
     bl_label = "Emil's Normal Brush"
-    bl_description = ("Blur custom normals under the cursor, also across separate mesh islands.\n"
+    bl_description = ("Blur custom normals under the cursor on every selected mesh, also across separate islands and objects.\n"
                      "Ctrl restores, F sets the radius, Shift+F the strength")
     bl_icon = "brush.sculpt.smooth"
     bl_widget = None
@@ -455,11 +514,10 @@ class EMILSNB_OT_toggle(bpy.types.Operator):
         if active_tool_id(context) == TOOL_ID:
             bpy.ops.wm.tool_set_by_id(name=_previous_tool["idname"])
             return {"FINISHED"}
-        obj = context.active_object
-        if obj is None or obj.type != "MESH":
+        if not selected_meshes(context):
             self.report({"WARNING"}, "Select a mesh first")
             return {"CANCELLED"}
-        if obj.mode != "OBJECT":
+        if context.mode != "OBJECT":
             bpy.ops.object.mode_set(mode="OBJECT")
         prev = active_tool_id(context)
         if prev and prev != TOOL_ID:

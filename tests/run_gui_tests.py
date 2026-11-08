@@ -125,6 +125,33 @@ def steps():
     check("Stop Brush goes back to the previous tool", off_id == "builtin.select_box", off_id)
     yield 0.3
 
+    # Two selected meshes in Edit Mode: Start goes to Object Mode + the tool for both.
+    bm = bmesh.new()
+    bmesh.ops.create_uvsphere(bm, u_segments=32, v_segments=16, radius=1.0)
+    mesh2 = bpy.data.meshes.new("Ball2")
+    bm.to_mesh(mesh2)
+    bm.free()
+    obj2 = bpy.data.objects.new("Ball2", mesh2)
+    obj2.location = (1.2, 0.0, 0.0)
+    scene.collection.objects.link(obj2)
+    obj2.select_set(True)
+    obj.select_set(True)
+    bpy.context.view_layer.objects.active = obj
+    with bpy.context.temp_override(window=window, area=area, region=region):
+        bpy.ops.wm.tool_set_by_id(name="builtin.select_box")
+        bpy.ops.object.mode_set(mode="EDIT")
+    yield 0.3
+    in_edit = obj.mode == "EDIT" and obj2.mode == "EDIT"
+    with bpy.context.temp_override(window=window, area=area, region=region):
+        bpy.ops.emils.normal_brush_toggle()
+    yield 0.3
+    with bpy.context.temp_override(window=window, area=area, region=region):
+        on_id = brush.active_tool_id(bpy.context)
+    check("Start Brush with 2 selected meshes in Edit Mode goes to Object Mode + the tool",
+          in_edit and obj.mode == "OBJECT" and obj2.mode == "OBJECT" and on_id == "emils.normal_brush",
+          f"was edit {in_edit}, now {obj.mode}/{obj2.mode} / {on_id}")
+    yield 0.2
+
     scene.emils_normal_brush.show_normals = True
     handle = bpy.types.SpaceView3D.draw_handler_add(probe_draw, (), "WINDOW", "POST_PIXEL")
     for _ in range(3):

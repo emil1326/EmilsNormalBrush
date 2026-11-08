@@ -1,6 +1,6 @@
 # Emil's Normal Brush
 
-Brush that blurs custom split normals in Object Mode, across unwelded mesh islands (neighbours by world distance). **Blender 3.6 LTS only**, no 4.x/5.x code. README.md explains how to use it.
+Brush that blurs custom split normals in Object Mode on ALL selected mesh objects, across unwelded mesh islands and across separate objects (neighbours by world distance). **Blender 3.6 LTS only**, no 4.x/5.x code. README.md explains how to use it.
 
 ## Layout
 
@@ -14,6 +14,7 @@ Brush that blurs custom split normals in Object Mode, across unwelded mesh islan
 
 ## Notes
 
+- One stroke = `brush.Session(objs, active=...)`: a `core.ObjectNormals` slice per object (local loop normals, world vertex normals via the inverse transpose of the 3x3) inside one `core.NormalBrushState` over the concatenated world positions. Blur targets are averaged in world space and converted back to each object's local space (`M^T * n`). Linked duplicates (same `obj.data`) are skipped after the first, only objects with `changed` get written, Mirror X uses the active object's local X. One-object case is the same code, no separate path.
 - Dab logic lives in `core.NormalBrushState.dab` / `brush.Session.dab`, the modal only converts mouse to hit + world radius, so tests drive it without events.
 - The GUI test can't make Blender call `draw_cursor` (that would need the real mouse), so the cursor code is run through a POST_PIXEL handler. `draw_cursor` gets the mouse in window or region space depending on the viewport, `draw_hover_normals` checks `gpu.state.viewport_get()` for that. If the cursor circle ever sits offset in the real viewport, look there first.
 - Writing text (README, CHANGELOG, UI strings) follows Emil's voice from the global CLAUDE.md.
