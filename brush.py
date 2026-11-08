@@ -337,10 +337,11 @@ class Session:
         return visible
 
     def dab(self, hit_world, world_radius, settings, mode="BLUR", hit_normal=None, view=None):
-        """view = (origin, direction, perspective) of the viewer, leave it out to skip the occlusion check."""
+        """view = (origin, direction, perspective) of the viewer. No view, or Only Visible off, skips the occlusion check."""
         if hit_normal is None:                       # no ray at hand (tests): use the face closest to the hit
             _loc, hit_normal, _i, _d = self.bvh.find_nearest(Vector(hit_world))
-        visible = None if view is None else self.visible_fn(view)
+        occlude = view is not None and getattr(settings, "only_visible", True)
+        visible = self.visible_fn(view) if occlude else None
         return self.state.dab(hit_world, world_radius, settings.strength, settings.blur_distance,
                               mode, settings.mirror_x, hit_normal, visible)
 

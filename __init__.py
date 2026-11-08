@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Emil's Normal Brush",
     "author": "Emil",
-    "version": (1, 3, 0),
+    "version": (1, 3, 1),
     "blender": (3, 6, 0),
     "location": "3D Viewport > Toolbar (Object Mode) and Sidebar > Emil",
     "description": "A brush that blurs custom split normals on all selected meshes, also across separate islands and objects",

@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.3.1 (2026-11-07)
+
+The occlusion is a toggle now, **Only Visible**, on by default. Turn it off when you actually want to paint what's hidden behind, like the feather layers underneath.
+
 ## 1.3.0 (2026-11-07)
 
 It paints what you actually SEE now. Feathers with a shape key and a Mirror modifier were the test case, and honestly the old version was painting somewhere in the past, where the feather used to be xD

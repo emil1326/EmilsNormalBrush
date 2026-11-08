@@ -15,6 +15,10 @@ class EmilsNormalBrushSettings(bpy.types.PropertyGroup):
         default=0.1, min=0.0001, soft_max=10.0, precision=4, subtype="DISTANCE")
     mirror_x: BoolProperty(
         name="Mirror X", description="Also dab at the mirrored spot across the object's local X", default=False)
+    only_visible: BoolProperty(
+        name="Only Visible",
+        description="Only paint vertices you can see from the view. Turn it off to also paint what's hidden behind (layers underneath, the inside)",
+        default=True)
     show_normals: BoolProperty(
         name="Show Normals", description="Draw the normals of the vertices under the brush while hovering",
         default=False)

@@ -29,6 +29,7 @@ def draw_props(layout, settings):
     row.operator("emils.normal_brush_auto_distance", text="Auto")
     row = layout.row(align=True)
     row.prop(settings, "mirror_x", toggle=True)
+    row.prop(settings, "only_visible", toggle=True)
     row.prop(settings, "show_normals", toggle=True)
 
 

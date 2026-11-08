@@ -932,6 +932,15 @@ def run():
     sess.dab((0, 0, 0), 2.0, s, "BLUR", (0, 0, 1.0))
     check("feathers: without a view (no occlusion check) the lower layers do get painted too",
           not np.array_equal(sl.ln[l_of_loop > 0], ln0[l_of_loop > 0]))
+    sess.restore_start()
+    s.only_visible = False
+    sess = brush.Session(fe)
+    sl = sess.state.objs[0]
+    ln0 = sl.ln.copy()
+    sess.dab((0, 0, 0), 2.0, s, "BLUR", (0, 0, 1.0), ((0.0, 0.0, 6.0), (0.0, 0.0, -1.0), True))
+    check("feathers: Only Visible off paints the hidden layers even with a view",
+          not np.array_equal(sl.ln[l_of_loop > 0], ln0[l_of_loop > 0]))
+    s.only_visible = True
     dv = sess.visible_fn(((0.0, 0.0, 6.0), (0.0, 0.0, -1.0), True))
     pts = sess.vw[:600].copy()
     t0 = time.perf_counter()
