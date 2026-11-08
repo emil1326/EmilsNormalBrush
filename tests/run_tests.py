@@ -270,7 +270,7 @@ def run():
         def targets(aff, rel, hit, radius, blur_distance):
             d = np.linalg.norm(state.vw[aff][:, None, :] - state.vw[None, :, :], axis=2)
             out = (d < blur_distance).astype(np.float32) @ state.vn
-            return core_normalize(out)
+            return core_normalize(out), np.ones(len(aff), dtype=bool)
         return targets
 
     def low_run(old, bd, label=None):
@@ -496,6 +496,176 @@ def run():
     b.modifiers.new("NE", "NORMAL_EDIT")
     check("modifier warning lists Object: Modifier over the selected meshes",
           ui.overwriting_modifiers_all([a, b]) == ["BallA: WN", "BallB: NE"], str(ui.overwriting_modifiers_all([a, b])))
+
+    # ---- 1.2.1: only the front side of the mesh gets painted
+    def angle_deg(a, b):
+        return np.degrees(np.arccos(np.clip(np.einsum("ij,ij->i", a, b), -1, 1)))
+
+    # thin slab: two flat sheets 0.05 apart (top faces up, bottom faces down), brush radius 1.2 is way thicker
+    clear_scene()
+    bm = bmesh.new()
+    bmesh.ops.create_grid(bm, x_segments=24, y_segments=24, size=3.0)
+    top_n = len(bm.verts)
+    res = bmesh.ops.create_grid(bm, x_segments=24, y_segments=24, size=3.0, matrix=Matrix.Translation((0, 0, -0.05)))
+    bmesh.ops.reverse_faces(bm, faces=[f for f in bm.faces if f.verts[0].co.z < -0.01])
+    mesh = bpy.data.meshes.new("Slab")
+    bm.to_mesh(mesh)
+    bm.free()
+    mesh.polygons.foreach_set("use_smooth", [True] * len(mesh.polygons))
+    slab = bpy.data.objects.new("Slab", mesh)
+    bpy.context.scene.collection.objects.link(slab)
+    bpy.context.view_layer.objects.active = slab
+    slab.select_set(True)
+    # start with the top tilted ~20 deg and the bottom plain, so there is something to blur
+    nl = len(mesh.loops)
+    lv = np.empty(nl, dtype=np.int32)
+    mesh.loops.foreach_get("vertex_index", lv)
+    vz = np.empty(len(mesh.vertices) * 3, dtype=np.float32)
+    mesh.vertices.foreach_get("co", vz)
+    is_top = vz.reshape(-1, 3)[lv, 2] > -0.01
+    rng = np.random.default_rng(3)
+    start = np.tile(np.array([0.0, 0.0, 1.0], dtype=np.float32), (nl, 1))
+    start[~is_top] = (0, 0, -1)
+    start[is_top] += rng.normal(0, 0.18, (int(is_top.sum()), 3)).astype(np.float32)
+    start = core_normalize(start)
+    brush.prepare_mesh(mesh)
+    mesh.normals_split_custom_set(start)
+    mesh.update()
+    s = Settings()
+    s.blur_distance = 0.3
+    s.strength = 0.8
+    sess = brush.Session(slab)
+    ln0 = sess.state.objs[0].ln.copy()
+    up = np.array([0.0, 0.0, 1.0], dtype=np.float32)
+    err0 = angle_deg(ln0[is_top], np.tile(up, (int(is_top.sum()), 1)))
+    for _ in range(3):
+        for p in [(0, 0, 0), (0.5, 0.3, 0), (-0.4, 0.2, 0), (0.1, -0.5, 0)]:
+            sess.dab(p, 1.2, s)
+    ln1 = sess.state.objs[0].ln
+    check("thin slab: bottom-side loop normals are bit-identical after dabbing the top",
+          np.array_equal(ln1[~is_top], ln0[~is_top]))
+    err1 = angle_deg(ln1[is_top], np.tile(up, (int(is_top.sum()), 1)))
+    moved_top = np.linalg.norm(ln1[is_top] - ln0[is_top], axis=1) > 1e-6
+    info(f"thin slab: top max angle to +up {err0.max():.1f} -> {err1.max():.1f} deg, "
+         f"inside the dabbed area (moved loops) {err1[moved_top].max():.1f} deg max, mean {err1[moved_top].mean():.1f}")
+    worse = float((err1[moved_top] - err0[moved_top]).max())
+    info(f"thin slab: mean angle to +up of the moved loops {err0[moved_top].mean():.1f} -> {err1[moved_top].mean():.1f} deg, "
+         f"worst single loop got {worse:+.2f} deg")
+    check("thin slab: top normals blur toward +up, nothing flips or goes to garbage",
+          moved_top.sum() > 50 and worse < 1.0 and err1[moved_top].mean() < err0[moved_top].mean() * 0.7,
+          f"worst {worse:+.2f} deg")
+    sess.restore_start()
+    for p in [(0, 0, 0), (0.5, 0.3, 0)]:
+        sess.dab(p, 1.2, s, "RESTORE")
+    check("thin slab: restore leaves the bottom alone too", np.array_equal(sess.state.objs[0].ln[~is_top], ln0[~is_top]))
+    clear_scene()
+
+    # sphere, brush bigger than the whole ball
+    obj, per = make_balls([(0, 0, 0)], segments=32, rings=16)
+    sess = brush.Session(obj)
+    st = sess.state
+    ln0 = st.objs[0].ln.copy()
+    lvs = st.objs[0].loop_vert
+    pos = sess.vw[lvs]
+    dabs = [(0, 0, 1.0), (0.6, 0, 0.8), (0, 0.6, 0.8)]
+    radial_all = core_normalize(pos.astype(np.float32))
+    back = np.all([radial_all @ np.array(d, dtype=np.float32) < -0.45 for d in dabs], axis=0)   # behind every dab
+    for _ in range(3):
+        for p in dabs:
+            sess.dab(p, 3.0, s)
+    ln1 = st.objs[0].ln
+    check("big brush on a sphere: back hemisphere is bit-identical", np.array_equal(ln1[back], ln0[back]),
+          f"{int(back.sum())} loops")
+    front = pos[:, 2] > 0.3
+    radial = core_normalize(pos[front].astype(np.float32))
+    e = angle_deg(ln1[front], radial)
+    info(f"big brush on a sphere: front max angle to radial {e.max():.2f} deg, mean {e.mean():.2f}")
+    check("big brush on a sphere: front stays on the sphere's normals", e.max() < 8, f"{e.max():.2f} deg")
+    sess.state.dab((0, 0, 1.0), 3.0, 0.8, 0.3, "RESTORE", hit_normal=(0, 0, 1.0))
+    check("big brush restore: back hemisphere bit-identical",
+          np.array_equal(st.objs[0].ln[back], ln0[back]))
+    clear_scene()
+
+    # mirror dab keeps the facing rule: Mirror X on a thin slab dabbed on the left top leaves both bottoms alone
+    bm = bmesh.new()
+    bmesh.ops.create_grid(bm, x_segments=24, y_segments=24, size=3.0)
+    bmesh.ops.create_grid(bm, x_segments=24, y_segments=24, size=3.0, matrix=Matrix.Translation((0, 0, -0.05)))
+    bmesh.ops.reverse_faces(bm, faces=[f for f in bm.faces if f.verts[0].co.z < -0.01])
+    mesh = bpy.data.meshes.new("Slab2")
+    bm.to_mesh(mesh)
+    bm.free()
+    mesh.polygons.foreach_set("use_smooth", [True] * len(mesh.polygons))
+    slab = bpy.data.objects.new("Slab2", mesh)
+    bpy.context.scene.collection.objects.link(slab)
+    slab.rotation_euler = (0.5, 0.2, 0.9)       # rotated, so the mirrored normal needs the local X plane
+    bpy.context.view_layer.update()
+    bpy.context.view_layer.objects.active = slab
+    sess = brush.Session(slab)
+    wz = sess.vw
+    local_z = np.array([v.co.z for v in mesh.vertices])
+    bot_v = local_z < -0.01
+    bot_l = bot_v[sess.state.objs[0].loop_vert]
+    ln0 = sess.state.objs[0].ln.copy()
+    s.mirror_x = True
+    hit = slab.matrix_world @ Vector((-0.8, 0.2, 0.0))
+    for _ in range(3):
+        sess.dab(tuple(hit), 1.2, s)
+    s.mirror_x = False
+    moved = np.linalg.norm(sess.state.objs[0].ln - ln0, axis=1) > 1e-7
+    check("mirror dab on a rotated thin slab: bottoms bit-identical", np.array_equal(sess.state.objs[0].ln[bot_l], ln0[bot_l]))
+    clear_scene()
+
+    # negative scale and anisotropic scale + rotation: written normals must match the analytic surface normal
+    for label, mat in (("mirrored (scale -1,1,1)", Matrix.Scale(-1, 4, Vector((1, 0, 0)))),
+                       ("rotated, scale 2 x 0.5 x 1",
+                        Matrix.Rotation(0.8, 4, Vector((1, 2, 3)).normalized())
+                        @ Matrix.Diagonal((2.0, 0.5, 1.0, 1.0)))):
+        obj, per = make_balls([(0, 0, 0)], segments=32, rings=16)
+        obj.matrix_world = mat
+        bpy.context.view_layer.update()
+        sess = brush.Session(obj)
+        m3 = np.array(obj.matrix_world, dtype=np.float64)[:3, :3]
+        ctr = sess.vw.mean(axis=0)
+        hit_loc = tuple(np.array(obj.matrix_world @ Vector((0, 0, 1.0))))
+        for _ in range(3):
+            sess.dab(hit_loc, 4.0, s)
+        sess.write()
+        mesh = obj.data
+        ln = read_loop_normals(mesh)
+        lvv = np.empty(len(mesh.loops), dtype=np.int32)
+        mesh.loops.foreach_get("vertex_index", lvv)
+        co = np.empty(len(mesh.vertices) * 3, dtype=np.float32)
+        mesh.vertices.foreach_get("co", co)
+        co = co.reshape(-1, 3)[lvv]
+        inv_t = np.linalg.inv(m3).T
+        got = core_normalize((ln @ inv_t.T).astype(np.float32))            # written local normal -> world
+        want = core_normalize((co @ inv_t.T).astype(np.float32))           # analytic: M^-T p for the unit sphere
+        if np.linalg.det(m3) < 0:
+            pass                                                          # M^-T p is already the outward normal
+        e = angle_deg(got, want)
+        front = (co[:, 2] > 0.2)
+        info(f"{label}: written normals vs analytic surface normal, front max {e[front].max():.2f} deg, "
+             f"all max {e.max():.2f} deg")
+        check(f"{label}: normals land where the surface normal is", e.max() < 12, f"{e.max():.2f} deg")
+        clear_scene()
+
+    # cancellation: a vertex whose plain normal is +x sits between an up-facing and a down-facing sheet,
+    # facing can't separate them (both ~90 deg), the sum cancels and the vertex has to stay put
+    from EmilsNormalBrush import core as ncore
+    verts = np.array([[-1, -1, 0.01], [1, -1, 0.01], [0, 1, 0.01],
+                      [-1, -1, -0.01], [1, -1, -0.01], [0, 1, -0.01],
+                      [0, 0, 0]], dtype=np.float32)
+    tris = np.array([[0, 1, 2], [3, 5, 4]], dtype=np.int64)               # up sheet, down sheet
+    plain = np.array([[0, 0, 1]] * 3 + [[0, 0, -1]] * 3 + [[1, 0, 0]], dtype=np.float32)
+    loop_vert = np.arange(7)
+    ln = plain.copy()
+    on = ncore.ObjectNormals(verts, loop_vert, ln, plain)
+    st = ncore.NormalBrushState([on], tris=tris)
+    st.dab((0, 0, 0), 2.0, 1.0, 0.5)
+    check("cancelling neighbourhood: the vertex isn't moved", np.array_equal(on.ln[6], ln[6]),
+          str(on.ln[6]))
+    check("cancelling neighbourhood: the others still blur normally", on.touched)
+    clear_scene()
 
     # ---- timing on a ~20k loop mesh
     clear_scene()

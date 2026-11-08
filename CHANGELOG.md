@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.2.1 (2026-11-07)
+
+Fixed the "puts my normals in a completely wrong place" bug. Turns out the brush was picking BOTH sides of a mesh when the brush was wider than the mesh is thick, and the blur then averaged faces pointing in opposite directions. They cancel out, the sum points wherever, yeah. Sadly xD
+
+- Only vertices on the side you're pointing at get painted (their normal has to face about the same way as the face under the cursor, `FACING_LIMIT`). Mirror X mirrors that face normal too. Restore follows the same rule.
+- The blur target ignores faces that face away from the vertex, so the other side of a thin wall doesn't leak in, but the crease between two merged balls still counts.
+- If the faces around a vertex still cancel out, that vertex just stays as it is instead of getting garbage.
+- Objects with a negative scale (mirrored) had their face normals computed inside out, now fixed too.
+
 ## 1.2.0 (2026-11-07)
 
 Works on low-poly meshes now. With few vertices there was barely anything in reach, so the blur almost didn't happen.

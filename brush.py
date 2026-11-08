@@ -133,16 +133,25 @@ class Session:
             mesh.calc_loop_triangles()
             t = np.empty(len(mesh.loop_triangles) * 3, dtype=np.int32)
             mesh.loop_triangles.foreach_get("vertices", t)
-            tris.append(t.reshape(-1, 3).astype(np.int64) + int(off))
+            t = t.reshape(-1, 3).astype(np.int64) + int(off)
+            if np.linalg.det(np.array(obj.matrix_world, dtype=np.float64)[:3, :3]) < 0:
+                t = t[:, [0, 2, 1]]           # mirrored object (negative scale): keep the world winding outward
+            tris.append(t)
         return np.concatenate(tris)
 
     def raycast(self, origin, direction):
-        loc, _normal, _index, _dist = self.bvh.ray_cast(origin, direction)
-        return loc
+        return self.raycast_normal(origin, direction)[0]
 
-    def dab(self, hit_world, world_radius, settings, mode="BLUR"):
+    def raycast_normal(self, origin, direction):
+        """(hit location, hit face normal), both world space, (None, None) on a miss."""
+        loc, normal, _index, _dist = self.bvh.ray_cast(origin, direction)
+        return loc, normal
+
+    def dab(self, hit_world, world_radius, settings, mode="BLUR", hit_normal=None):
+        if hit_normal is None:                       # no ray at hand (tests): use the face closest to the hit
+            _loc, hit_normal, _i, _d = self.bvh.find_nearest(Vector(hit_world))
         return self.state.dab(hit_world, world_radius, settings.strength, settings.blur_distance,
-                              mode, settings.mirror_x)
+                              mode, settings.mirror_x, hit_normal)
 
     def write(self):
         """Write every object whose normals changed since the last write."""
@@ -217,12 +226,12 @@ class EMILSNB_OT_stroke(bpy.types.Operator):
     def _dab_at(self, context, xy):
         settings = context.scene.emils_normal_brush
         origin, direction = view_ray(context, xy)
-        hit = self.session.raycast(origin, direction)
+        hit, normal = self.session.raycast_normal(origin, direction)
         self.last_xy = xy
         if hit is None:
             return False
         r = world_radius_at(context, xy, hit, settings.radius)
-        return self.session.dab(hit, r, settings, self.mode)
+        return self.session.dab(hit, r, settings, self.mode, normal)
 
     def _finish(self, context):
         context.window_manager.event_timer_remove(self.timer)

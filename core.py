@@ -12,6 +12,8 @@ into each object's local space.
 import numpy as np
 
 CHUNK = 256  # affected vertices handled per matrix block, keeps memory small
+FACING_LIMIT = -0.25  # dot above this counts as "same side": a crease of two merged balls passes, the back of a thin wall (~-1) does not
+CANCEL_LIMIT = 0.3    # blur target with |sum| under this x the summed weights is cancellation garbage, leave that vertex alone
 
 
 def normalize(a):
@@ -49,6 +51,7 @@ class ObjectNormals:
         m3 = self.mw[:3, :3]
         self.to_world = np.linalg.inv(m3).T.astype(np.float32)   # local normal -> world (inverse transpose)
         self.to_local = m3.T.astype(np.float32)                  # world normal -> local (transpose)
+        self.plain_world = normalize(self.plain @ self.to_world.T)               # (V,3) world, never changes
         self.nverts = len(self.vw)
         self.changed = False       # any loop normal moved since the last write
         self.touched = False       # any loop normal moved since the stroke began
@@ -71,6 +74,14 @@ class ObjectNormals:
         local[0] = -local[0]
         return (self.mw @ local)[:3]
 
+    def mirror_normal(self, n_world):
+        """Mirror a world normal across this object's local X plane."""
+        local = self.to_local.astype(np.float64) @ np.asarray(n_world, dtype=np.float64)
+        local[0] = -local[0]
+        out = self.to_world.astype(np.float64) @ local
+        length = np.linalg.norm(out)
+        return out / length if length > 1e-12 else out
+
 
 class NormalBrushState:
     """All objects of a stroke. With one object this is the plain single-object brush."""
@@ -83,6 +94,7 @@ class NormalBrushState:
         self.offsets = np.concatenate([[0], np.cumsum(sizes)]).astype(np.int64)
         self.vw = np.ascontiguousarray(np.concatenate([o.vw for o in self.objs]), dtype=np.float32)
         self.vn = np.concatenate([o.vn_world for o in self.objs])   # (N,3) world unit vertex normals
+        self.plain_w = np.concatenate([o.plain_world for o in self.objs])   # (N,3) world plain vertex normals
         self._setup_tris(np.zeros((0, 3), dtype=np.int64) if tris is None else np.asarray(tris, dtype=np.int64))
 
     def _setup_tris(self, tris):
@@ -96,6 +108,8 @@ class NormalBrushState:
         self.tri_b = b.astype(np.float32)
         self.tri_c3 = c.astype(np.float32)
         self.tri_w = (0.5 * cr).astype(np.float32)                  # area * unit face normal
+        self.tri_n = normalize(cr).astype(np.float32)               # unit face normal
+        self.tri_wl = (0.5 * np.linalg.norm(cr, axis=1)).astype(np.float32)   # area
         cen = (a + b + c) / 3.0
         self.tri_c = cen.astype(np.float32)
         self.tri_r = np.maximum.reduce([np.linalg.norm(x - cen, axis=1) for x in (a, b, c)]).astype(np.float32)
@@ -112,23 +126,36 @@ class NormalBrushState:
     def mirror_point(self, hit_world):
         return self.objs[self.mirror_ref].mirror_point(hit_world)
 
-    def dab(self, hit_world, radius, strength, blur_distance, mode="BLUR", mirror_x=False):
-        """One brush dab. Returns True when any loop normal changed."""
-        changed = self._dab_one(np.asarray(hit_world, dtype=np.float64), radius, strength, blur_distance, mode)
+    def dab(self, hit_world, radius, strength, blur_distance, mode="BLUR", mirror_x=False, hit_normal=None):
+        """One brush dab. hit_normal (world, the face under the cursor) keeps the far side of a thin mesh out of it.
+        Returns True when any loop normal changed."""
+        hn = None if hit_normal is None else np.asarray(hit_normal, dtype=np.float64)
+        changed = self._dab_one(np.asarray(hit_world, dtype=np.float64), hn, radius, strength, blur_distance, mode)
         if mirror_x:
-            changed |= self._dab_one(self.mirror_point(hit_world), radius, strength, blur_distance, mode)
+            mhn = None if hn is None else self.objs[self.mirror_ref].mirror_normal(hn)
+            changed |= self._dab_one(self.mirror_point(hit_world), mhn, radius, strength, blur_distance, mode)
         return changed
 
-    def _dab_one(self, hit, radius, strength, blur_distance, mode):
+    def _dab_one(self, hit, hit_normal, radius, strength, blur_distance, mode):
         if radius <= 0 or strength <= 0:
             return False
         rel = self.vw - hit.astype(np.float32)
         dist = np.sqrt(np.einsum("ij,ij->i", rel, rel))
-        aff = np.nonzero(dist < radius)[0]
+        near = dist < radius
+        if hit_normal is not None:                                  # front side only
+            near &= self.plain_w @ hit_normal.astype(np.float32) > FACING_LIMIT
+        aff = np.nonzero(near)[0]
         if aff.size == 0:
             return False
+        if mode == "RESTORE":
+            target_world = None
+        else:
+            target_world, valid = self._blur_targets(aff, rel, hit, radius, blur_distance)
+            if not valid.all():                                     # cancelled out, leave those vertices alone
+                aff, target_world = aff[valid], target_world[valid]
+                if aff.size == 0:
+                    return False
         weight = falloff(dist[aff], radius) * strength
-        target_world = None if mode == "RESTORE" else self._blur_targets(aff, rel, hit, radius, blur_distance)
 
         any_changed = False
         for i, o in enumerate(self.objs):
@@ -161,25 +188,30 @@ class NormalBrushState:
         over every triangle near each affected vertex. Needs nothing but the static triangles, never the current
         normals, so repeated dabs settle on the surface shape instead of averaging themselves into mush."""
         out = self.vn[aff].copy()                                  # fallback: no face in reach
+        valid = np.ones(aff.size, dtype=bool)
         if len(self.tri_a) == 0:
-            return out
+            return out, valid
         hit32 = hit.astype(np.float32)
         cen_rel = self.tri_c - hit32                               # centroids relative to the hit
         cen_rel_sq = np.einsum("ij,ij->i", cen_rel, cen_rel)
         reach = radius + blur_distance + self.tri_r                # a triangle can matter if its centroid is this close
         cand = np.nonzero(cen_rel_sq < reach * reach)[0]
         if cand.size == 0:
-            return out
+            return out, valid
         cand = cand[np.argsort(cen_rel[cand, 0], kind="stable")]   # sorted along x, so a chunk only meets a slab
         ca, cb, cc = (x[cand] - hit32 for x in (self.tri_a, self.tri_b, self.tri_c3))
         cw = self.tri_w[cand]
+        cn = self.tri_n[cand]
+        cwl = self.tri_wl[cand]                                    # areas, for the cancellation test
         cen_rel = cen_rel[cand]
         crad = self.tri_r[cand] + blur_distance
         slack = cen_rel_sq[cand] - crad * crad                     # |c|^2 - R^2, the part of the test that is per triangle
         cx, max_r = cen_rel[:, 0], float(crad.max())
         order = np.argsort(rel[aff, 0], kind="stable")             # affected vertices sorted along x as well
         apos = rel[aff][order]
+        apn = self.plain_w[aff][order]
         acc = np.zeros((aff.size, 3), dtype=np.float32)
+        wsum = np.zeros(aff.size, dtype=np.float64)
         for start in range(0, aff.size, CHUNK):
             p = apos[start:start + CHUNK]
             lo, hi = np.searchsorted(cx, [p[0, 0] - max_r, p[-1, 0] + max_r])
@@ -192,15 +224,22 @@ class NormalBrushState:
             if vi.size == 0:
                 continue
             ti += lo
+            front = dot(cn[ti], apn[start:start + CHUNK][vi]) > FACING_LIMIT   # not the faces on the far side
+            vi, ti = vi[front], ti[front]
+            if vi.size == 0:
+                continue
             dist = np.sqrt(tri_dist2(p[vi], ca[ti], cb[ti], cc[ti]))
             w = falloff(dist, blur_distance)
             for k in range(3):
                 acc[start:start + CHUNK, k] = np.bincount(vi, weights=w * cw[ti, k], minlength=p.shape[0])
-        acc = acc[np.argsort(order)]                               # back to the order of `aff`
+            wsum[start:start + CHUNK] = np.bincount(vi, weights=w * cwl[ti], minlength=p.shape[0])
+        inv = np.argsort(order)                                    # back to the order of `aff`
+        acc, wsum = acc[inv], wsum[inv]
         length = np.linalg.norm(acc, axis=1)
         ok = length > 1e-12
         out[ok] = (acc[ok] / length[ok, None]).astype(np.float32)
-        return out
+        valid = length >= CANCEL_LIMIT * wsum                      # wsum 0 (nothing in reach) stays valid, keeps the fallback
+        return out, valid
 
 
 def dot(x, y):
