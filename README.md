@@ -1,6 +1,6 @@
 # Emil's Normal Brush
 
-A brush that blurs custom normals right under your cursor. I made it because of Kita'vali's balls... I mean the ball shapes, a body made of two spheres that overlap. They're two separate mesh islands that just intersect (not welded), so there's a hard shading line right where they meet and no amount of smooth shading fixes it. Welding wasn't an option, so I made the normals not care about topology at all.
+A brush that blurs custom normals right under your cursor. I had a mesh that's basically two balls stuck together, and there's always that ugly shading line right where they meet, smooth shading or not. So yeah, now I just paint over the seam and the normals line up across both sides, even when the two parts aren't connected at all :>
 
 Built for **Blender 3.6 LTS**.
 
