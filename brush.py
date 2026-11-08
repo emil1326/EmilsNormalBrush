@@ -407,7 +407,7 @@ class EmilsNormalBrushTool(bpy.types.WorkSpaceTool):
     bl_label = "Emil's Normal Brush"
     bl_description = ("Blur custom normals under the cursor, also across separate mesh islands.\n"
                      "Ctrl restores, F sets the radius, Shift+F the strength")
-    bl_icon = "ops.generic.select_circle"
+    bl_icon = "brush.sculpt.smooth"
     bl_widget = None
     bl_cursor = "CROSSHAIR"
     bl_keymap = (
@@ -431,13 +431,52 @@ class EmilsNormalBrushTool(bpy.types.WorkSpaceTool):
         draw_brush_cursor(context, xy)
 
 
-classes = (EMILSNB_OT_stroke, EMILSNB_OT_adjust, EMILSNB_OT_auto_distance, EMILSNB_OT_clear)
+TOOL_ID = EmilsNormalBrushTool.bl_idname
+_previous_tool = {"idname": "builtin.select_box"}   # what the Stop button switches back to
+
+
+def active_tool_id(context):
+    if context.workspace is None:
+        return ""
+    tool = context.workspace.tools.from_space_view3d_mode(context.mode, create=False)
+    return tool.idname if tool else ""
+
+
+class EMILSNB_OT_toggle(bpy.types.Operator):
+    bl_idname = "emils.normal_brush_toggle"
+    bl_label = "Start / Stop Normal Brush"
+    bl_description = "Turn Emil's Normal Brush on (switches to Object Mode) or back off to the tool you had before"
+
+    @classmethod
+    def poll(cls, context):
+        return context.area is not None and context.area.type == "VIEW_3D"
+
+    def execute(self, context):
+        if active_tool_id(context) == TOOL_ID:
+            bpy.ops.wm.tool_set_by_id(name=_previous_tool["idname"])
+            return {"FINISHED"}
+        obj = context.active_object
+        if obj is None or obj.type != "MESH":
+            self.report({"WARNING"}, "Select a mesh first")
+            return {"CANCELLED"}
+        if obj.mode != "OBJECT":
+            bpy.ops.object.mode_set(mode="OBJECT")
+        prev = active_tool_id(context)
+        if prev and prev != TOOL_ID:
+            _previous_tool["idname"] = prev
+        bpy.ops.wm.tool_set_by_id(name=TOOL_ID)
+        return {"FINISHED"}
+
+
+classes = (EMILSNB_OT_stroke, EMILSNB_OT_adjust, EMILSNB_OT_auto_distance, EMILSNB_OT_clear, EMILSNB_OT_toggle)
 
 
 def register():
     for c in classes:
         bpy.utils.register_class(c)
-    bpy.utils.register_tool(EmilsNormalBrushTool, after={"builtin.select_box"}, separator=True)
+    # Own slot at the end of the toolbar. With after={"builtin.select_box"} Blender hides it inside the
+    # select tools' flyout group, where nobody finds it.
+    bpy.utils.register_tool(EmilsNormalBrushTool, separator=True)
 
 
 def unregister():

@@ -6,11 +6,11 @@ Built for **Blender 3.6 LTS**.
 
 ## Install
 
-Run `python tools/build_zip.py` (or zip the `EmilsNormalBrush` folder), then Edit > Preferences > Add-ons > Install and turn on **Emil's Normal Brush**. The tool shows up in the toolbar in Object Mode (the one with the circle icon, under the select tools), and the settings are also in the 3D View sidebar, in the **Emil** tab.
+Run `python tools/build_zip.py` (or zip the `EmilsNormalBrush` folder), then Edit > Preferences > Add-ons > Install and turn on **Emil's Normal Brush**. Then open the sidebar (N), go to the **Emil** tab, and there's a big **Start Brush** button. That's it. It also lives at the very bottom of the toolbar in Object Mode (the smooth brush icon) if you prefer clicking there.
 
 ## Using it
 
-Pick the tool, select your mesh (it has to be the active object), and paint over the seam. Each dab looks at all the vertices within **Blur Distance** of a vertex, wherever they are, connected or not, and pulls that vertex's normals toward their average. That's the whole trick: the distance is world units, so it reaches across the gap between two islands. Hit the **Auto** button next to it and it picks about 2.5 times the mean edge length, which was a good start on everything I tried. Make it bigger for a softer blend, smaller if it starts eating details.
+Select your mesh, hit **Start Brush** (it jumps to Object Mode by itself if you were in Edit Mode), and paint over the seam. **Stop Brush** puts you back on the tool you had before. Each dab looks at all the vertices within **Blur Distance** of a vertex, wherever they are, connected or not, and pulls that vertex's normals toward their average. That's the whole trick: the distance is world units, so it reaches across the gap between two islands. Hit the **Auto** button next to it and it picks about 2.5 times the mean edge length, which was a good start on everything I tried. Make it bigger for a softer blend, smaller if it starts eating details.
 
 **Strength** is how far each dab pulls, **Radius** is the brush size on screen in pixels. Ctrl+drag does the opposite job, it pulls the normals back toward the plain vertex normals, so you can undo a blur you went overboard with. Mirror X also dabs on the other side of the object's local X, and Show Normals draws little blue lines for the vertices under the circle so you can see what's going on.
 

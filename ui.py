@@ -1,5 +1,7 @@
 import bpy
 
+from . import brush
+
 
 def overwriting_modifiers(obj):
     """Names of modifiers on obj that will replace the custom normals we paint."""
@@ -34,12 +36,16 @@ class EMILSNB_PT_main(bpy.types.Panel):
 
     def draw(self, context):
         layout = self.layout
+        on = brush.active_tool_id(context) == brush.TOOL_ID
+        row = layout.row()
+        row.scale_y = 1.6
+        row.operator("emils.normal_brush_toggle", text="Stop Brush" if on else "Start Brush",
+                     icon="PAUSE" if on else "PLAY", depress=on)
         draw_props(layout, context.scene.emils_normal_brush)
         for name in overwriting_modifiers(context.active_object):
             layout.label(text=f"'{name}' overwrites custom normals", icon="ERROR")
         layout.separator()
         layout.operator("emils.normal_brush_clear", text="Clear Custom Normals")
-        layout.label(text="Pick the tool in the toolbar (Object Mode)")
 
 
 classes = (EMILSNB_PT_main,)

@@ -99,6 +99,32 @@ def steps():
     check("tool_set_by_id picks Emil's Normal Brush", tool is not None and tool.idname == "emils.normal_brush",
           f"{res} / {getattr(tool, 'idname', None)}")
 
+    # The tool must sit in its own toolbar slot, not hidden inside the select tools' flyout group.
+    from bl_ui.space_toolsystem_common import ToolSelectPanelHelper, ToolDef
+    tools = ToolSelectPanelHelper._tool_class_from_space_type("VIEW_3D")._tools["OBJECT"]
+    top_level = [t.idname for t in tools if isinstance(t, ToolDef)]
+    check("tool has its own toolbar slot (not in a group)", "emils.normal_brush" in top_level)
+
+    # Start/Stop button: from Edit Mode with the select tool, Start goes to Object Mode + our tool,
+    # Stop goes back to the select tool.
+    with bpy.context.temp_override(window=window, area=area, region=region):
+        bpy.ops.wm.tool_set_by_id(name="builtin.select_box")
+        bpy.ops.object.mode_set(mode="EDIT")
+        bpy.ops.emils.normal_brush_toggle()
+    yield 0.3
+    with bpy.context.temp_override(window=window, area=area, region=region):
+        on_id = brush.active_tool_id(bpy.context)
+    check("Start Brush switches to Object Mode + the tool",
+          obj.mode == "OBJECT" and on_id == "emils.normal_brush", f"{obj.mode} / {on_id}")
+    with bpy.context.temp_override(window=window, area=area, region=region):
+        bpy.ops.emils.normal_brush_toggle()
+    yield 0.3
+    with bpy.context.temp_override(window=window, area=area, region=region):
+        off_id = brush.active_tool_id(bpy.context)
+        bpy.ops.wm.tool_set_by_id(name="emils.normal_brush")
+    check("Stop Brush goes back to the previous tool", off_id == "builtin.select_box", off_id)
+    yield 0.3
+
     scene.emils_normal_brush.show_normals = True
     handle = bpy.types.SpaceView3D.draw_handler_add(probe_draw, (), "WINDOW", "POST_PIXEL")
     for _ in range(3):
