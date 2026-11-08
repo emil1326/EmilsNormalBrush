@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.3.0 (2026-11-07)
+
+It paints what you actually SEE now. Feathers with a shape key and a Mirror modifier were the test case, and honestly the old version was painting somewhere in the past, where the feather used to be xD
+
+- Shape keys: the brush uses the shape key mix you see (values, relative keys, vertex groups, muted keys, "show only active shape key"), for the raycast, the faces and the vertices. The stored normals get turned along with the surface and turned back when they're written, checked against what Blender itself shows (mean error 0.3 degrees, the odd loop around 5).
+- Mirror modifier: click on the mirrored half and the dab lands on the real vertices, and the mirrored faces count for the blur, so the seam at the mirror plane blends with its other half. Several axes, a mirror object and two Mirror modifiers in a row work, bisect and flip are ignored. Blender 3.6 mirrors custom normals itself, so you only paint one side. Mirror X in the brush is a separate thing and stays.
+- Occlusion: vertices hidden behind another face (stacked layers, feathers) don't get painted anymore, only what the viewer can see. Mirror X skips that check on purpose, it paints the symmetric spot even if it's behind the mesh.
+
 ## 1.2.1 (2026-11-07)
 
 Fixed the "puts my normals in a completely wrong place" bug. Turns out the brush was picking BOTH sides of a mesh when the brush was wider than the mesh is thick, and the blur then averaged faces pointing in opposite directions. They cancel out, the sum points wherever, yeah. Sadly xD

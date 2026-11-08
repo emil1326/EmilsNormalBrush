@@ -667,6 +667,279 @@ def run():
     check("cancelling neighbourhood: the others still blur normally", on.touched)
     clear_scene()
 
+    # ---- 1.3.0: paint what you SEE (shape keys, Mirror modifier, stacked layers)
+    from EmilsNormalBrush import core as ncore
+
+    def evaluated(obj, modifiers=False):
+        """(local positions, local loop normals) of the depsgraph-evaluated mesh. Modifiers are switched off
+        for the evaluation unless asked for, and switched back on afterwards."""
+        state = [(m, m.show_viewport) for m in obj.modifiers]
+        if not modifiers:
+            for m, _ in state:
+                m.show_viewport = False
+        bpy.context.view_layer.update()
+        dg = bpy.context.evaluated_depsgraph_get()
+        me = bpy.data.meshes.new_from_object(obj.evaluated_get(dg))
+        me.calc_normals_split()
+        co = np.empty(len(me.vertices) * 3, dtype=np.float32)
+        me.vertices.foreach_get("co", co)
+        ln = read_loop_normals(me)
+        lv = np.empty(len(me.loops), dtype=np.int32)
+        me.loops.foreach_get("vertex_index", lv)
+        bpy.data.meshes.remove(me)
+        for m, v in state:
+            m.show_viewport = v
+        bpy.context.view_layer.update()
+        return co.reshape(-1, 3), ln, lv
+
+    def make_shape_sphere(with_mirror=False):
+        clear_scene()
+        obj, per = make_balls([(0, 0, 0)], segments=32, rings=16)
+        obj.matrix_world = Matrix.Translation((0.3, -0.2, 0.1)) @ Matrix.Rotation(0.4, 4, "Z") @ Matrix.Scale(1.4, 4)
+        mesh = obj.data
+        co = np.array([v.co[:] for v in mesh.vertices], dtype=np.float64)
+        # custom normals to start with, not just the smooth ones
+        wob = co + 0.25 * np.stack([np.sin(3 * co[:, 0]), np.cos(2 * co[:, 1]), np.sin(4 * co[:, 2])], axis=1)
+        brush.prepare_mesh(mesh)
+        lvv = np.empty(len(mesh.loops), dtype=np.int32)
+        mesh.loops.foreach_get("vertex_index", lvv)
+        mesh.normals_split_custom_set(core_normalize(wob.astype(np.float32))[lvv])
+        obj.shape_key_add(name="Basis")
+        k1 = obj.shape_key_add(name="Twist")
+        ang = np.radians(40.0) * np.clip(co[:, 2] / 0.6, 0.0, 1.0)          # tip of the sphere tilts ~40 deg about X
+        cy, sy = np.cos(ang), np.sin(ang)
+        moved = co.copy()
+        moved[:, 1] = co[:, 1] * cy - co[:, 2] * sy
+        moved[:, 2] = co[:, 1] * sy + co[:, 2] * cy
+        for i, p in enumerate(moved):
+            k1.data[i].co = p
+        k1.value = 1.0
+        k2 = obj.shape_key_add(name="Bulge")
+        for i, p in enumerate(co):
+            k2.data[i].co = p * (1.0 + 0.2 * (p[0] > 0))
+        k2.value = 0.5
+        vg = obj.vertex_groups.new(name="Right")
+        for i, p in enumerate(co):
+            if p[0] > 0:
+                vg.add([i], 0.8, "REPLACE")
+        k2.vertex_group = "Right"
+        obj.active_shape_key_index = 1
+        if with_mirror:
+            m = obj.modifiers.new("Mir", "MIRROR")
+            m.use_axis = (True, False, False)
+        bpy.context.view_layer.update()
+        return obj
+
+    # displayed positions against Blender's own evaluation (modifiers off), also with a Mirror modifier on
+    obj = make_shape_sphere(with_mirror=True)
+    ev_co, _, _ = evaluated(obj)
+    mine = brush.displayed_local(obj)
+    err = float(np.abs(mine - ev_co).max())
+    base = brush.basis_local(obj)
+    check("shape keys: displayed positions match Blender's evaluation (value, relative key, vertex group)",
+          err < 1e-5 and np.abs(base - ev_co).max() > 0.05, f"max err {err:.2e}, shape key moved things up to "
+          f"{np.abs(base - ev_co).max():.2f}")
+    obj.show_only_shape_key = True
+    obj.active_shape_key_index = 1
+    ev_co, _, _ = evaluated(obj)
+    err = float(np.abs(brush.displayed_local(obj) - ev_co).max())
+    check("shape keys: 'show only active shape key' matches too", err < 1e-5, f"max err {err:.2e}")
+    obj.show_only_shape_key = False
+    obj.data.shape_keys.key_blocks["Twist"].mute = True
+    ev_co, _, _ = evaluated(obj)
+    err = float(np.abs(brush.displayed_local(obj) - ev_co).max())
+    check("shape keys: a muted key is skipped", err < 1e-5, f"max err {err:.2e}")
+    obj.data.shape_keys.key_blocks["Twist"].mute = False
+
+    # custom normals follow the deformation: displayed state vs Blender's evaluated normals
+    obj = make_shape_sphere()
+    ev_co, ev_ln, ev_lv = evaluated(obj)
+    sess = brush.Session(obj)
+    sl = sess.state.objs[0]
+    mw = np.array(obj.matrix_world, dtype=np.float64)
+    check("shape keys: Session positions are the displayed ones",
+          np.abs(sess.vw - (ev_co.astype(np.float64) @ mw[:3, :3].T + mw[:3, 3])).max() < 1e-4)
+    e0 = angle_deg(sl.ln, ev_ln)
+    base_ln = read_loop_normals(obj.data)
+    e_plain = angle_deg(base_ln, ev_ln)
+    info(f"shape key normals, nothing painted: stored->displayed rotation vs Blender's evaluation: mean {e0.mean():.2f} "
+         f"max {e0.max():.2f} deg (not rotating at all would be mean {e_plain.mean():.1f} max {e_plain.max():.1f} deg)")
+    worst = int(np.argmax(e0))
+    info(f"shape key normals, nothing painted: 99th percentile {np.percentile(e0, 99):.2f} deg, the worst loop sits at "
+         f"local z {ev_co[ev_lv[worst]][2]:.2f} (original {ev_co[ev_lv[worst]].tolist()})")
+    check("shape keys: the rotated stored normals match what Blender displays",
+          e0.mean() < 1.0 and np.percentile(e0, 99) < 4.0 and e0.max() < 8.0, f"mean {e0.mean():.2f}, max {e0.max():.2f} deg")
+    s = Settings()
+    s.blur_distance = 0.3
+    s.strength = 0.8
+    top = brush.world_positions(obj)
+    tip = tuple(top[np.argmax(top[:, 2])])
+    for _ in range(3):
+        for off in [(0, 0, 0), (0.3, 0.1, -0.2), (-0.3, -0.2, -0.3), (0, 0.4, -0.4)]:
+            sess.dab(tuple(np.array(tip) + off), 0.9, s)
+    moved = np.linalg.norm(sl.ln - sl.start_ln, axis=1) > 1e-4
+    sess.write()
+    _, ev_ln2, _ = evaluated(obj)
+    e1 = angle_deg(sl.ln, ev_ln2)
+    info(f"shape key normals after painting ({int(moved.sum())} loops moved): written -> evaluated vs intended: "
+         f"mean {e1.mean():.2f} max {e1.max():.2f} deg, on the painted loops mean {e1[moved].mean():.2f} "
+         f"max {e1[moved].max():.2f}")
+    check("shape keys: painted normals show up where intended once Blender evaluates the shape key",
+          moved.sum() > 100 and e1[moved].max() < 3.0 and e1.mean() < 1.0 and e1.max() < 8.0,
+          f"painted max {e1[moved].max():.2f} deg, overall max {e1.max():.2f}")
+    # the numpy rotation itself is exactly invertible, also for a == b and a == -b
+    a = core_normalize(np.array([[0, 0, 1], [0, 0, 1], [1, 0, 0], [0.3, 0.2, 0.9]], dtype=np.float32)).astype(np.float64)
+    b = core_normalize(np.array([[0, 0, 1], [0, 0, -1], [1, 1e-9, 0], [-0.4, 0.5, 0.2]], dtype=np.float32)).astype(np.float64)
+    v = core_normalize(np.array([[1, 2, 3], [1, 2, 3], [0, 1, 1], [3, 1, -2]], dtype=np.float32)).astype(np.float64)
+    fwd = ncore.rotate_arc(v, a, b)
+    back = ncore.rotate_arc(fwd, b, a)
+    check("rotate_arc: a->b maps a onto b, b->a undoes it, a == b and a == -b are fine",
+          np.abs(ncore.rotate_arc(a, a, b) - b).max() < 1e-5 and np.abs(back - v).max() < 1e-5
+          and np.allclose(np.linalg.norm(fwd, axis=1), 1.0), f"{np.abs(back - v).max():.1e}")
+    clear_scene()
+
+    # what does the 3.6 Mirror modifier do with custom normals?
+    bm = bmesh.new()
+    bmesh.ops.create_grid(bm, x_segments=4, y_segments=4, size=1.0, matrix=Matrix.Translation((1.5, 0, 0)))
+    mesh = bpy.data.meshes.new("MirrorN")
+    bm.to_mesh(mesh)
+    bm.free()
+    mesh.polygons.foreach_set("use_smooth", [True] * len(mesh.polygons))
+    mobj = bpy.data.objects.new("MirrorN", mesh)
+    bpy.context.scene.collection.objects.link(mobj)
+    brush.prepare_mesh(mesh)
+    mesh.normals_split_custom_set(np.tile(core_normalize(np.array([[0.5, 0.2, 0.84]], dtype=np.float32)),
+                                          (len(mesh.loops), 1)))
+    mm = mobj.modifiers.new("Mir", "MIRROR")
+    mm.use_axis = (True, False, False)
+    mm.use_mirror_merge = False
+    ev_co, ev_ln, ev_lv = evaluated(mobj, modifiers=True)
+    left = ev_co[ev_lv][:, 0] < 0
+    want_mirrored = core_normalize(np.array([[-0.5, 0.2, 0.84]], dtype=np.float32))[0]
+    want_same = core_normalize(np.array([[0.5, 0.2, 0.84]], dtype=np.float32))[0]
+    got = ev_ln[left].mean(axis=0)
+    got /= np.linalg.norm(got)
+    to_mir = float(np.degrees(np.arccos(np.clip(got @ want_mirrored, -1, 1))))
+    to_same = float(np.degrees(np.arccos(np.clip(got @ want_same, -1, 1))))
+    info(f"Mirror modifier and custom normals: mirrored loops (x<0) have normal {np.round(got, 3).tolist()}, "
+         f"{to_mir:.2f} deg from the mirrored normal, {to_same:.1f} deg from the unmirrored copy "
+         f"-> Blender {'DOES' if to_mir < 2 else 'does NOT'} mirror custom normals")
+    clear_scene()
+
+    # a click on the Mirror modifier's copy lands on the real half, and the copy's faces take part in the blur
+    def half_sphere(mirror):
+        clear_scene()
+        bm = bmesh.new()
+        bmesh.ops.create_uvsphere(bm, u_segments=32, v_segments=16, radius=1.0)
+        geom = bm.verts[:] + bm.edges[:] + bm.faces[:]
+        bmesh.ops.bisect_plane(bm, geom=geom, plane_co=(0, 0, 0), plane_no=(1, 0, 0), clear_inner=True, dist=1e-5)
+        mesh = bpy.data.meshes.new("Half")
+        bm.to_mesh(mesh)
+        bm.free()
+        mesh.polygons.foreach_set("use_smooth", [True] * len(mesh.polygons))
+        ob = bpy.data.objects.new("Half", mesh)
+        bpy.context.scene.collection.objects.link(ob)
+        bpy.context.view_layer.objects.active = ob
+        ob.select_set(True)
+        if mirror:
+            m = ob.modifiers.new("Mir", "MIRROR")
+            m.use_axis = (True, False, False)
+        # start with scrambled custom normals so the dabs have something to fix
+        brush.prepare_mesh(mesh)
+        lvv = np.empty(len(mesh.loops), dtype=np.int32)
+        mesh.loops.foreach_get("vertex_index", lvv)
+        co = np.array([v.co[:] for v in mesh.vertices], dtype=np.float32)
+        r = np.random.default_rng(5).normal(0, 0.35, co.shape).astype(np.float32)
+        mesh.normals_split_custom_set(core_normalize(co + r)[lvv])
+        bpy.context.view_layer.update()
+        return ob
+
+    ob = half_sphere(True)
+    sess = brush.Session(ob)
+    check("Mirror modifier: the session knows one mirrored copy", len(sess.ghosts) == 1, str(len(sess.ghosts)))
+    p = sess.pick((-0.6, 0.0, 5.0), (0.0, 0.0, -1.0))
+    ok_pick = (p is not None and p.loc[0] > 0.3 and p.shown[0] < -0.3 and abs(p.loc[0] + p.shown[0]) < 1e-4
+               and p.normal[0] > 0 and p.normal[2] > 0 and p.view[0][0] > 0)
+    check("Mirror modifier: a click on the copy maps back to the real half (point, normal, view)", ok_pick,
+          f"shown x {p.shown[0]:.2f} -> real x {p.loc[0]:.2f}" if p else "miss")
+    p_real = sess.pick((0.6, 0.0, 5.0), (0.0, 0.0, -1.0))
+    check("Mirror modifier: a click on the real half is left alone", p_real is not None and np.allclose(p_real.loc, p_real.shown))
+    s = Settings()
+    s.blur_distance = 0.3
+    s.strength = 0.8
+    sl = sess.state.objs[0]
+    before_ln = sl.ln.copy()
+    for _ in range(3):
+        sess.dab(p.loc, 0.5, s, "BLUR", p.normal, p.view)
+    mv = np.nonzero(np.linalg.norm(sl.ln - before_ln, axis=1) > 1e-5)[0]
+    mx = sess.vw[sl.loop_vert[mv]][:, 0]
+    check("Mirror modifier: painting the copy changes real vertices on the real side only", len(mv) > 20 and (mx > 0).all(),
+          f"{len(mv)} loops, x {mx.min():.2f}..{mx.max():.2f}")
+    # blur target includes the mirror image: at the mirror plane the painted normals come out symmetric (nx ~ 0)
+    def plane_error(with_mirror):
+        ob2 = half_sphere(with_mirror)
+        sess2 = brush.Session(ob2)
+        sl2 = sess2.state.objs[0]
+        on_plane = np.abs(sess2.vw[sl2.loop_vert][:, 0]) < 1e-4
+        for _ in range(5):
+            for pt in [(0.0, 0.0, 1.0), (0.0, 0.7, 0.7), (0.0, -0.7, 0.7), (0.0, 0.9, 0.0), (0.0, -0.9, 0.0)]:
+                sess2.dab(pt, 0.5, s, "BLUR", (1.0, 0.0, 0.0))
+        return float(np.degrees(np.arcsin(np.clip(np.abs(sl2.ln[on_plane][:, 0]), 0, 1))).mean())
+    e_with, e_without = plane_error(True), plane_error(False)
+    info(f"Mirror modifier blur at the mirror plane: mean angle off the plane's symmetry {e_without:.1f} deg without, "
+         f"{e_with:.1f} deg with the copy's faces")
+    check("Mirror modifier: faces of the copy are blurred against (plane normals end up more symmetric)",
+          e_with < e_without, f"{e_without:.1f} -> {e_with:.1f}")
+    clear_scene()
+
+    # feathers: three stacked layers 0.02 apart under a much bigger brush, painted from above
+    bm = bmesh.new()
+    for z in (0.0, -0.02, -0.04):
+        bmesh.ops.create_grid(bm, x_segments=20, y_segments=20, size=3.0, matrix=Matrix.Translation((0, 0, z)))
+    mesh = bpy.data.meshes.new("Feathers")
+    bm.to_mesh(mesh)
+    bm.free()
+    mesh.polygons.foreach_set("use_smooth", [True] * len(mesh.polygons))
+    fe = bpy.data.objects.new("Feathers", mesh)
+    bpy.context.scene.collection.objects.link(fe)
+    bpy.context.view_layer.objects.active = fe
+    lvv = np.empty(len(mesh.loops), dtype=np.int32)
+    mesh.loops.foreach_get("vertex_index", lvv)
+    co = np.array([v.co[:] for v in mesh.vertices], dtype=np.float32)
+    layer_v = np.round(-co[:, 2] / 0.02).astype(int)
+    brush.prepare_mesh(mesh)
+    wob = np.stack([0.5 * np.sin(4 * co[:, 0]), 0.5 * np.cos(3 * co[:, 1]), np.ones(len(co))], axis=1).astype(np.float32)
+    mesh.normals_split_custom_set(core_normalize(wob)[lvv])
+    bpy.context.view_layer.update()
+    s = Settings()
+    s.blur_distance = 0.3
+    s.strength = 0.8
+    for label, persp, view in (("perspective", True, ((0.0, 0.0, 6.0), (0.0, 0.0, -1.0))),
+                               ("ortho", False, ((0.0, 0.0, 6.0), (0.0, 0.0, -1.0)))):
+        sess = brush.Session(fe)
+        sl = sess.state.objs[0]
+        l_of_loop = layer_v[sl.loop_vert]
+        ln0 = sl.ln.copy()
+        for pt in [(0, 0, 0), (0.5, 0.4, 0), (-0.6, 0.2, 0)]:
+            sess.dab(pt, 2.0, s, "BLUR", (0, 0, 1.0), (view[0], view[1], persp))
+        top_moved = int((np.linalg.norm(sl.ln - ln0, axis=1)[l_of_loop == 0] > 1e-5).sum())
+        check(f"feathers ({label} view): lower two layers are bit-identical, top layer gets painted",
+              np.array_equal(sl.ln[l_of_loop > 0], ln0[l_of_loop > 0]) and top_moved > 100, f"{top_moved} top loops moved")
+        sess.restore_start()
+    sess = brush.Session(fe)
+    sl = sess.state.objs[0]
+    ln0 = sl.ln.copy()
+    sess.dab((0, 0, 0), 2.0, s, "BLUR", (0, 0, 1.0))
+    check("feathers: without a view (no occlusion check) the lower layers do get painted too",
+          not np.array_equal(sl.ln[l_of_loop > 0], ln0[l_of_loop > 0]))
+    dv = sess.visible_fn(((0.0, 0.0, 6.0), (0.0, 0.0, -1.0), True))
+    pts = sess.vw[:600].copy()
+    t0 = time.perf_counter()
+    for _ in range(5):
+        dv(pts, 2.0)
+    info(f"occlusion check: {(time.perf_counter() - t0) / 5 * 1000:.1f} ms for 600 vertices")
+    clear_scene()
+
     # ---- timing on a ~20k loop mesh
     clear_scene()
     obj, per = make_balls([(0, 0, 0)], segments=100, rings=50)

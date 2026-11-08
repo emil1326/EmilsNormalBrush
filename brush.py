@@ -18,6 +18,7 @@ from . import core
 
 WRITE_INTERVAL = 1.0 / 30.0   # max writes to the mesh per second
 AUTO_FACTOR = 1.5             # Auto Blur Distance = this x mean edge length
+OCCLUDE_TOL = 0.001          # a face this much (x brush radius) in front of a vertex hides it; layers can sit 0.02 apart under a big brush
 SPACING = 0.15                # dab spacing, fraction of the brush radius (in pixels)
 
 _hover_cache = {}             # per object name, see hover_data
@@ -39,11 +40,66 @@ def prepare_mesh(mesh):
         mesh.auto_smooth_angle = math.pi
 
 
-def world_positions(obj):
+def _key_co(kb, n):
+    co = np.empty(n * 3, dtype=np.float32)
+    kb.data.foreach_get("co", co)
+    return co.reshape(-1, 3).astype(np.float64)
+
+
+def basis_local(obj):
+    """Local vertex positions of the basis shape (what mesh.vertices holds), float64."""
     mesh = obj.data
     co = np.empty(len(mesh.vertices) * 3, dtype=np.float32)
     mesh.vertices.foreach_get("co", co)
-    co = co.reshape(-1, 3).astype(np.float64)
+    return co.reshape(-1, 3).astype(np.float64)
+
+
+def _group_weights(obj, name):
+    """Per vertex weight of vertex group `name` (0 where the vertex isn't in it)."""
+    mesh = obj.data
+    vg = obj.vertex_groups.get(name)
+    w = np.zeros(len(mesh.vertices), dtype=np.float64)
+    if vg is None:
+        return np.ones(len(mesh.vertices), dtype=np.float64)     # Blender ignores a missing group
+    gi = vg.index
+    for i, v in enumerate(mesh.vertices):
+        for g in v.groups:
+            if g.group == gi:
+                w[i] = g.weight
+                break
+    return w
+
+
+def displayed_local(obj):
+    """Local vertex positions as Blender shows them before any modifier: the shape key mix.
+    Each non-muted key adds value * group weight * (key - its relative key); with 'show only active shape key'
+    just that key shows. Without shape keys this is the plain vertex positions."""
+    mesh = obj.data
+    n = len(mesh.vertices)
+    sk = mesh.shape_keys
+    if sk is None or len(sk.key_blocks) == 0:
+        return basis_local(obj)
+    ref = sk.reference_key
+    if obj.show_only_shape_key and obj.active_shape_key is not None:
+        return _key_co(obj.active_shape_key, n)
+    co = _key_co(ref, n)
+    if not sk.use_relative:
+        return co
+    for kb in sk.key_blocks:
+        if kb.as_pointer() == ref.as_pointer() or kb.mute or kb.value == 0.0:
+            continue
+        delta = _key_co(kb, n) - _key_co(kb.relative_key, n)
+        w = kb.value
+        if kb.vertex_group:
+            co += (w * _group_weights(obj, kb.vertex_group))[:, None] * delta
+        else:
+            co += w * delta
+    return co
+
+
+def world_positions(obj, local=None):
+    """World positions of the displayed (shape key mixed, modifier free) vertices."""
+    co = displayed_local(obj) if local is None else local
     mw = np.array(obj.matrix_world, dtype=np.float64)
     return (co @ mw[:3, :3].T + mw[:3, 3]).astype(np.float32)
 
@@ -52,6 +108,50 @@ def mesh_edges(mesh):
     ev = np.empty(len(mesh.edges) * 2, dtype=np.int32)
     mesh.edges.foreach_get("vertices", ev)
     return ev.reshape(-1, 2)
+
+
+def poly_arrays(mesh):
+    start = np.empty(len(mesh.polygons), dtype=np.int64)
+    total = np.empty(len(mesh.polygons), dtype=np.int64)
+    mesh.polygons.foreach_get("loop_start", start)
+    mesh.polygons.foreach_get("loop_total", total)
+    return start, total
+
+
+# Modifiers that change the topology: a Mirror after one of these isn't a plain mirror of the base mesh any more.
+TOPOLOGY_MODIFIERS = {"SUBSURF", "ARRAY", "BEVEL", "BOOLEAN", "BUILD", "DECIMATE", "EDGE_SPLIT", "MASK", "MULTIRES",
+                      "REMESH", "SCREW", "SOLIDIFY", "SKIN", "TRIANGULATE", "WIREFRAME", "WELD", "NODES",
+                      "VOLUME_TO_MESH", "MESH_TO_VOLUME", "EXPLODE", "OCEAN", "PARTICLE_SYSTEM"}
+
+
+def mirror_matrices(obj):
+    """World-space 4x4 reflections, one per extra copy the Mirror modifiers (before the first topology changing
+    modifier) add. Several axes on one modifier give the X, Y, XY... copies, a second Mirror mirrors the first
+    one's copies as well. Bisect and flip are ignored."""
+    copies = [np.identity(4)]
+    for mod in obj.modifiers:
+        if mod.type in TOPOLOGY_MODIFIERS:
+            break
+        if mod.type != "MIRROR" or not mod.show_viewport:
+            continue
+        axes = [i for i in range(3) if mod.use_axis[i]]
+        if not axes:
+            continue
+        ref = np.array((mod.mirror_object or obj).matrix_world, dtype=np.float64)
+        ref_inv = np.linalg.inv(ref)
+        subsets = [[a for k, a in enumerate(axes) if mask >> k & 1] for mask in range(1, 1 << len(axes))]
+        added = []
+        for sub in subsets:
+            s = np.identity(4)
+            for a in sub:
+                s[a, a] = -1.0
+            w = ref @ s @ ref_inv
+            added += [w @ c for c in copies]
+        copies += added
+        if len(copies) > 9:
+            copies = copies[:9]
+            break
+    return copies[1:]
 
 
 def unique_by_data(objs):
@@ -91,6 +191,15 @@ def auto_blur_distance(objs):
     return AUTO_FACTOR * total / count if count else 0.0
 
 
+class Pick:
+    """What a click hit, in the space of the REAL mesh: location, face normal, and the view the user sees it from.
+    `shown` is where the user sees it (differs from `loc` on a Mirror modifier's copy)."""
+
+    def __init__(self, loc, normal, shown, origin, direction, perspective):
+        self.loc, self.normal, self.shown = loc, normal, shown
+        self.view = (origin, direction, perspective)
+
+
 class Session:
     """Everything one stroke needs: the numpy state over all objects, one BVH to raycast, the write-back."""
 
@@ -112,14 +221,43 @@ class Session:
             mesh.loops.foreach_get("vertex_index", lv)
             pn = np.empty(nverts * 3, dtype=np.float32)
             mesh.vertices.foreach_get("normal", pn)
-            slices.append(core.ObjectNormals(world_positions(obj), lv, ln.reshape(-1, 3), pn.reshape(-1, 3),
-                                             obj.matrix_world))
+            disp = displayed_local(obj)
+            base = basis_local(obj)
+            rot = None
+            if np.abs(disp - base).max(initial=0.0) > 1e-7:     # a shape key moved things: normals follow the surface
+                ps, pt = poly_arrays(mesh)
+                nb_, nd_ = core.vertex_normals(base, lv, ps, pt), core.vertex_normals(disp, lv, ps, pt)
+                ref_v = core.ref_neighbors(lv, ps, pt, nverts)
+                rot = (core.vertex_frames(base, nb_, ref_v), core.vertex_frames(disp, nd_, ref_v))
+                pn = nd_
+            slices.append(core.ObjectNormals(world_positions(obj, disp), lv, ln.reshape(-1, 3), pn.reshape(-1, 3),
+                                             obj.matrix_world, rot=rot))
         ref = self.objects.index(active) if active in self.objects else 0
         offsets = np.concatenate([[0], np.cumsum([s.nverts for s in slices])]).astype(np.int64)
-        self.tris = self._triangles(offsets)
-        self.state = core.NormalBrushState(slices, mirror_ref=ref, tris=self.tris)
+        real_tris = self._triangles(offsets)
+        self.n_real_tris = len(real_tris)
+        vw_real = np.concatenate([s.vw for s in slices])
+        # the Mirror modifier's copies: static ghost triangles, they are raycast and blurred against
+        ghost_vw, ghost_tris, self.ghosts = [], [], []
+        gv_off, t_off = len(vw_real), len(real_tris)
+        for obj, sl, off, nxt in zip(self.objects, slices, offsets[:-1], offsets[1:]):
+            own = real_tris[(real_tris >= off).all(axis=1) & (real_tris < nxt).all(axis=1)]
+            for w in mirror_matrices(obj):
+                gp = (sl.vw.astype(np.float64) @ w[:3, :3].T + w[:3, 3]).astype(np.float32)
+                t = own - int(off) + gv_off
+                if np.linalg.det(w[:3, :3]) < 0:
+                    t = t[:, [0, 2, 1]]
+                ghost_vw.append(gp)
+                ghost_tris.append(t)
+                self.ghosts.append((w, t_off, len(t)))
+                gv_off += len(gp)
+                t_off += len(t)
+        self.tris = real_tris if not ghost_tris else np.concatenate([real_tris] + ghost_tris)
+        gvw = np.concatenate(ghost_vw) if ghost_vw else None
+        self.state = core.NormalBrushState(slices, mirror_ref=ref, tris=self.tris, ghost_vw=gvw)
         self.vw = self.state.vw
-        self.bvh = BVHTree.FromPolygons(self.vw.tolist(), self.tris.tolist())
+        allw = self.vw if gvw is None else np.concatenate([self.vw, gvw])
+        self.bvh = BVHTree.FromPolygons(allw.tolist(), self.tris.tolist())
 
     @property
     def dirty(self):
@@ -140,18 +278,71 @@ class Session:
         return np.concatenate(tris)
 
     def raycast(self, origin, direction):
-        return self.raycast_normal(origin, direction)[0]
+        pick = self.pick(origin, direction)
+        return None if pick is None else pick.loc
 
-    def raycast_normal(self, origin, direction):
-        """(hit location, hit face normal), both world space, (None, None) on a miss."""
-        loc, normal, _index, _dist = self.bvh.ray_cast(origin, direction)
-        return loc, normal
+    def pick(self, origin, direction, perspective=True):
+        """Raycast the view ray. A hit on a Mirror modifier's copy is mapped back to the real mesh (point, normal
+        and the view ray itself), so the dab lands where the vertices really are."""
+        loc, normal, index, _dist = self.bvh.ray_cast(Vector(origin), Vector(direction))
+        if loc is None:
+            return None
+        o, d = np.array(origin, dtype=np.float64), np.array(direction, dtype=np.float64)
+        shown = np.array(loc, dtype=np.float64)
+        p, n = shown.copy(), np.array(normal, dtype=np.float64)
+        if index >= self.n_real_tris:
+            for w, start, count in self.ghosts:
+                if start <= index < start + count:
+                    winv = np.linalg.inv(w)
+                    p = (winv @ np.append(shown, 1.0))[:3]
+                    n = w[:3, :3].T @ n
+                    n /= max(np.linalg.norm(n), 1e-12)
+                    o = (winv @ np.append(o, 1.0))[:3]
+                    d = winv[:3, :3] @ d
+                    d /= max(np.linalg.norm(d), 1e-12)
+                    break
+        return Pick(tuple(p), tuple(n), tuple(shown), o, d, perspective)
 
-    def dab(self, hit_world, world_radius, settings, mode="BLUR", hit_normal=None):
+    def visible_fn(self, view):
+        """Returns visible(points, radius) -> bool mask: False for points a face clearly in front of them hides
+        from the viewer (a ray from the eye to the point hits something more than OCCLUDE_TOL x radius sooner)."""
+        origin, direction, perspective = view
+        origin = np.asarray(origin, dtype=np.float64)
+        direction = np.asarray(direction, dtype=np.float64)
+        ray_cast = self.bvh.ray_cast
+
+        def visible(points, radius):
+            pts = np.asarray(points, dtype=np.float64)
+            tol = max(OCCLUDE_TOL * radius, 1e-6)
+            if perspective:
+                vec = pts - origin
+                dist = np.linalg.norm(vec, axis=1)
+                dirs = vec / np.maximum(dist, 1e-12)[:, None]
+                starts = np.broadcast_to(origin, pts.shape)
+            else:                                           # ortho: parallel rays from the plane through `origin`
+                dist = (pts - origin) @ direction
+                dirs = np.broadcast_to(direction, pts.shape)
+                starts = pts - dirs * dist[:, None]
+            ok = np.ones(len(pts), dtype=bool)
+            s_l, d_l, m_l = starts.tolist(), dirs.tolist(), (dist + tol).tolist()
+            lim = (dist - tol).tolist()
+            for i in range(len(pts)):
+                loc = ray_cast(s_l[i], d_l[i], m_l[i])[0]
+                if loc is not None:
+                    s = s_l[i]
+                    if ((loc[0] - s[0]) ** 2 + (loc[1] - s[1]) ** 2 + (loc[2] - s[2]) ** 2) ** 0.5 < lim[i]:
+                        ok[i] = False
+            return ok
+
+        return visible
+
+    def dab(self, hit_world, world_radius, settings, mode="BLUR", hit_normal=None, view=None):
+        """view = (origin, direction, perspective) of the viewer, leave it out to skip the occlusion check."""
         if hit_normal is None:                       # no ray at hand (tests): use the face closest to the hit
             _loc, hit_normal, _i, _d = self.bvh.find_nearest(Vector(hit_world))
+        visible = None if view is None else self.visible_fn(view)
         return self.state.dab(hit_world, world_radius, settings.strength, settings.blur_distance,
-                              mode, settings.mirror_x, hit_normal)
+                              mode, settings.mirror_x, hit_normal, visible)
 
     def write(self):
         """Write every object whose normals changed since the last write."""
@@ -159,7 +350,7 @@ class Session:
         for obj, sl in zip(self.objects, self.state.objs):
             if not sl.changed:
                 continue
-            obj.data.normals_split_custom_set(sl.ln)
+            obj.data.normals_split_custom_set(sl.base_normals())
             obj.data.update()
             sl.changed = False
             wrote = True
@@ -171,7 +362,7 @@ class Session:
             if not sl.touched:
                 continue
             sl.reset()
-            obj.data.normals_split_custom_set(sl.ln)
+            obj.data.normals_split_custom_set(sl.base_normals())
             obj.data.update()
             sl.changed = sl.touched = False
         self.state.reset()
@@ -226,12 +417,12 @@ class EMILSNB_OT_stroke(bpy.types.Operator):
     def _dab_at(self, context, xy):
         settings = context.scene.emils_normal_brush
         origin, direction = view_ray(context, xy)
-        hit, normal = self.session.raycast_normal(origin, direction)
+        pick = self.session.pick(origin, direction, context.region_data.is_perspective)
         self.last_xy = xy
-        if hit is None:
+        if pick is None:
             return False
-        r = world_radius_at(context, xy, hit, settings.radius)
-        return self.session.dab(hit, r, settings, self.mode, normal)
+        r = world_radius_at(context, xy, Vector(pick.shown), settings.radius)
+        return self.session.dab(pick.loc, r, settings, self.mode, pick.normal, pick.view)
 
     def _finish(self, context):
         context.window_manager.event_timer_remove(self.timer)
@@ -386,11 +577,19 @@ def draw_circle(x, y, radius, color, segments=64):
     gpu.state.blend_set("NONE")
 
 
+def _shape_signature(obj):
+    sk = obj.data.shape_keys
+    if sk is None:
+        return None
+    return (obj.show_only_shape_key, obj.active_shape_key_index,
+            tuple((kb.value, kb.mute) for kb in sk.key_blocks))
+
+
 def hover_data(obj):
     """World positions and unit vertex normals (world space) of obj, cached until something changes."""
     mesh = obj.data
     key = (mesh.name, len(mesh.vertices), len(mesh.loops), mesh.has_custom_normals,
-           tuple(round(v, 5) for row in obj.matrix_world for v in row), _cache_version)
+           tuple(round(v, 5) for row in obj.matrix_world for v in row), _cache_version, _shape_signature(obj))
     entry = _hover_cache.get(obj.name)
     if entry is not None and entry[0] == key:
         return entry[1], entry[2]
@@ -401,10 +600,18 @@ def hover_data(obj):
     lv = np.empty(nloops, dtype=np.int32)
     mesh.loops.foreach_get("vertex_index", lv)
     ln = ln.reshape(-1, 3)
+    disp = displayed_local(obj)
+    base = basis_local(obj)
+    if np.abs(disp - base).max(initial=0.0) > 1e-7:          # shape key: the normals follow the surface
+        ps, pt = poly_arrays(mesh)
+        ref_v = core.ref_neighbors(lv, ps, pt, len(mesh.vertices))
+        fa = core.vertex_frames(base, core.vertex_normals(base, lv, ps, pt), ref_v)
+        fb = core.vertex_frames(disp, core.vertex_normals(disp, lv, ps, pt), ref_v)
+        ln = core.rotate_frames(ln, fa[lv], fb[lv])
     sums = np.stack([np.bincount(lv, weights=ln[:, k], minlength=len(mesh.vertices)) for k in range(3)], axis=1)
     mw = np.array(obj.matrix_world, dtype=np.float64)
     nrm = core.normalize((sums @ np.linalg.inv(mw[:3, :3])).astype(np.float32))  # inverse transpose
-    pos = world_positions(obj)
+    pos = world_positions(obj, disp)
     _hover_cache[obj.name] = (key, pos, nrm)
     return pos, nrm
 
