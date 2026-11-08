@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.2.0 (2026-11-07)
+
+Works on low-poly meshes now. With few vertices there was barely anything in reach, so the blur almost didn't happen.
+
+- The blur target of a vertex is now the normalized sum of area * face normal * falloff over every face (of all painted objects, world space) within Blur Distance, measured to the closest point of the face. Faces the vertex belongs to always count fully.
+- It no longer reads the current normals, so repeated dabs converge to the surface shape instead of mush. Restore is unchanged.
+- Old vertex-normal averaging is gone, no mode switch.
+- Auto Blur Distance is 1.5 x the mean edge length now (was 2.5), picked from a sweep on low-poly and dense test meshes.
+
 ## 1.1.0 (2026-11-07)
 
 Works on every selected mesh now, not just the active one. Two separate balls blend fine!

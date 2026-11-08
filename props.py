@@ -11,7 +11,7 @@ class EmilsNormalBrushSettings(bpy.types.PropertyGroup):
         default=0.5, min=0.0, max=1.0, subtype="FACTOR")
     blur_distance: FloatProperty(
         name="Blur Distance",
-        description="How far a vertex looks for neighbours, in world units. This is what reaches across the gap between two separate islands",
+        description="How far from a vertex a face can be and still count, in world units (distance to the face itself). This is what reaches across the gap between two separate islands",
         default=0.1, min=0.0001, soft_max=10.0, precision=4, subtype="DISTANCE")
     mirror_x: BoolProperty(
         name="Mirror X", description="Also dab at the mirrored spot across the object's local X", default=False)

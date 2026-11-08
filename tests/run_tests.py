@@ -213,7 +213,7 @@ def run():
         bpy.ops.emils.normal_brush_auto_distance()
     d = scene.emils_normal_brush.blur_distance
     mean_edge = brush.core.mean_edge_length(brush.world_positions(obj), brush.mesh_edges(obj.data))
-    check("Auto sets blur distance to 2.5 x mean edge length", abs(d - 2.5 * mean_edge) < 1e-5 and d > 0.05,
+    check("Auto sets blur distance to AUTO_FACTOR x mean edge length", abs(d - brush.AUTO_FACTOR * mean_edge) < 1e-5 and d > 0.05,
           f"{d:.4f}")
 
     # ---- mirror
@@ -249,6 +249,106 @@ def run():
     brush.Session(obj)
     check("auto smooth already on keeps the user's angle",
           obj.data.use_auto_smooth and abs(obj.data.auto_smooth_angle - 0.5) < 1e-4)
+
+    # ---- low-poly: two coarse spheres as separate objects, one with a nasty transform
+    def low_poly_pair(segments=8, rings=6):
+        clear_scene()
+        a, _ = make_balls([(0, 0, 0)], segments, rings)
+        a.name = "LowA"
+        b, _ = make_balls([(0, 0, 0)], segments, rings)
+        b.name = "LowB"
+        b.matrix_world = (Matrix.Translation((1.2, 0.2, 0.1))
+                          @ Matrix.Rotation(0.5, 4, Vector((1.0, 2.0, 3.0)).normalized()) @ Matrix.Scale(1.2, 4))
+        bpy.context.view_layer.update()
+        a.select_set(True)
+        b.select_set(True)
+        bpy.context.view_layer.objects.active = a
+        return a, b
+
+    def old_vertex_targets(state):
+        """The 1.1 blur target, kept here only to tell the difference: mean of the current vertex normals in reach."""
+        def targets(aff, rel, hit, radius, blur_distance):
+            d = np.linalg.norm(state.vw[aff][:, None, :] - state.vw[None, :, :], axis=2)
+            out = (d < blur_distance).astype(np.float32) @ state.vn
+            return core_normalize(out)
+        return targets
+
+    def low_run(old, bd, label=None):
+        a, b = low_poly_pair()
+        sess = brush.Session([a, b], active=a)
+        if old:
+            sess.state._blur_targets = old_vertex_targets(sess.state)
+        st = Settings()
+        st.blur_distance = bd
+        before, seam = cross_seam(sess, near=0.8)
+        pts = [tuple(p) for p in sess.vw[seam]]
+        nb, pb = world_vn(sess, 1)
+        d = np.linalg.norm(sess.vw[seam][:, None, :] - pb[None, :, :], axis=2)
+        pts += [tuple(pb[j]) for j in np.unique(d.argmin(axis=1))]
+        for _ in range(4):
+            for p in pts:
+                sess.dab(p, 0.9, st)
+        after, _ = cross_seam(sess, near=0.8)
+        return before, after, len(seam)
+
+    for f in (0.5, 1.0, 1.5, 2.0, 2.5):
+        a, b = low_poly_pair()
+        e = brush.core.mean_edge_length(brush.world_positions(a), brush.mesh_edges(a.data))
+        bd = f * e
+        nb_, na_, n_ = low_run(False, bd)
+        ob_, oa_, _ = low_run(True, bd)
+        info(f"low-poly factor {f} (blur distance {bd:.3f}, mean edge {e:.3f}): faces {nb_:.1f} -> {na_:.1f} deg, "
+             f"old vertex method {ob_:.1f} -> {oa_:.1f} deg ({n_} seam vertices)")
+    a, b = low_poly_pair()
+    bd = brush.auto_blur_distance([a, b])
+    nb_, na_, n_ = low_run(False, bd)
+    ob_, oa_, _ = low_run(True, bd)
+    info(f"low-poly with Auto distance {bd:.3f}: faces {nb_:.1f} -> {na_:.1f} deg, old vertex method {ob_:.1f} -> {oa_:.1f} deg")
+    check("low-poly: face blur brings the seam of two coarse spheres together", na_ < nb_ * 0.4, f"{nb_:.1f} -> {na_:.1f} deg")
+
+    # ---- not mush: the middle of one dense smooth sphere stays smooth, also after many dabs
+    clear_scene()
+    obj, per = make_balls([(0, 0, 0)], 64, 32)
+    sess = brush.Session(obj)
+    st = Settings()
+    st.blur_distance = brush.auto_blur_distance(obj)
+    plain_w = sess.state.objs[0].plain
+    rng = np.random.default_rng(3)
+    centre = np.array([0.0, 0.0, 1.0])
+    near = np.linalg.norm(sess.vw - centre, axis=1) < 0.4
+    def off_smooth():
+        dots = np.clip(np.einsum("ij,ij->i", sess.state.vn[near], plain_w[near]), -1, 1)
+        return float(np.degrees(np.arccos(dots)).max()), float(np.degrees(np.arccos(dots)).mean())
+    first = sess.state.vn.copy()
+    for k in range(60):
+        p = centre + rng.normal(size=3) * 0.12
+        p = p / np.linalg.norm(p)
+        sess.dab(tuple(p), 0.35, st)
+        if k == 0:
+            after1 = sess.state.vn.copy()
+    mx, mean = off_smooth()
+    info(f"not mush: after 60 dabs mid-sphere, normals vs smooth: max {mx:.2f} deg, mean {mean:.2f} deg")
+    check("not mush: dense sphere stays within a few degrees of its smooth normals after 60 dabs", mx < 4.0,
+          f"max {mx:.2f} deg")
+
+    # ---- dabs converge: the 20th dab changes less than the first
+    a, b = make_two_balls()
+    sess = brush.Session([a, b], active=a)
+    st = Settings()
+    st.blur_distance = brush.auto_blur_distance([a, b])
+    seam_pts = sess.vw[cross_seam(sess)[1]]
+    sweep = [tuple(p) for p in seam_pts[::3]]
+    near_seam = np.linalg.norm(sess.vw[:, None, :] - seam_pts[None, :, :], axis=2).min(axis=1) < 0.5
+    changes = []
+    for _ in range(20):
+        prev = sess.state.vn.copy()
+        for p in sweep:
+            sess.dab(p, 0.5, st)
+        ang = np.degrees(np.arccos(np.clip(np.einsum("ij,ij->i", prev, sess.state.vn), -1, 1)))
+        changes.append(float(ang[near_seam].mean()))
+    info(f"converge: mean normal change per sweep of dabs along the seam, 1st {changes[0]:.3f} deg, 5th {changes[4]:.3f}, 20th {changes[-1]:.3f}")
+    check("repeated dabs converge (the 20th sweep moves normals much less than the 1st)", changes[-1] < changes[0] * 0.25,
+          f"{changes[0]:.3f} -> {changes[-1]:.3f} deg")
 
     # ---- two separate objects, one with a nasty transform
     a, b = make_two_balls()
@@ -380,8 +480,8 @@ def run():
     for ob in (a, b):
         e, wp = brush.mesh_edges(ob.data), brush.world_positions(ob)
         lens.append(np.linalg.norm(wp[e[:, 0]] - wp[e[:, 1]], axis=1))
-    expect = 2.5 * float(np.concatenate(lens).mean())
-    only_a = 2.5 * float(lens[0].mean())
+    expect = brush.AUTO_FACTOR * float(np.concatenate(lens).mean())
+    only_a = brush.AUTO_FACTOR * float(lens[0].mean())
     check("Auto blur distance uses the mean edge length of all selected meshes",
           abs(d - expect) < 1e-5 and abs(d - only_a) > 1e-3, f"{d:.4f} (all) vs {only_a:.4f} (active only)")
     sess = brush.Session([a, b], active=a)

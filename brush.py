@@ -17,6 +17,7 @@ from mathutils.bvhtree import BVHTree
 from . import core
 
 WRITE_INTERVAL = 1.0 / 30.0   # max writes to the mesh per second
+AUTO_FACTOR = 1.5             # Auto Blur Distance = this x mean edge length
 SPACING = 0.15                # dab spacing, fraction of the brush radius (in pixels)
 
 _hover_cache = {}             # per object name, see hover_data
@@ -76,7 +77,7 @@ def selected_meshes(context, dedupe=True):
 
 
 def auto_blur_distance(objs):
-    """2.5 x the mean edge length (world space) over one object or a list of them."""
+    """AUTO_FACTOR x the mean edge length (world space) over one object or a list of them."""
     if isinstance(objs, bpy.types.Object):
         objs = [objs]
     total, count = 0.0, 0
@@ -87,7 +88,7 @@ def auto_blur_distance(objs):
         wp = world_positions(ob)
         total += float(np.linalg.norm(wp[ev[:, 0]] - wp[ev[:, 1]], axis=1).sum())
         count += len(ev)
-    return 2.5 * total / count if count else 0.0
+    return AUTO_FACTOR * total / count if count else 0.0
 
 
 class Session:
@@ -114,23 +115,26 @@ class Session:
             slices.append(core.ObjectNormals(world_positions(obj), lv, ln.reshape(-1, 3), pn.reshape(-1, 3),
                                              obj.matrix_world))
         ref = self.objects.index(active) if active in self.objects else 0
-        self.state = core.NormalBrushState(slices, mirror_ref=ref)
+        offsets = np.concatenate([[0], np.cumsum([s.nverts for s in slices])]).astype(np.int64)
+        self.tris = self._triangles(offsets)
+        self.state = core.NormalBrushState(slices, mirror_ref=ref, tris=self.tris)
         self.vw = self.state.vw
-        self.bvh = self._build_bvh()
+        self.bvh = BVHTree.FromPolygons(self.vw.tolist(), self.tris.tolist())
 
     @property
     def dirty(self):
         return any(o.changed for o in self.state.objs)
 
-    def _build_bvh(self):
+    def _triangles(self, offsets):
+        """All triangles of all objects as vertex indices into the concatenated positions."""
         tris = []
-        for obj, off in zip(self.objects, self.state.offsets):
+        for obj, off in zip(self.objects, offsets):
             mesh = obj.data
             mesh.calc_loop_triangles()
             t = np.empty(len(mesh.loop_triangles) * 3, dtype=np.int32)
             mesh.loop_triangles.foreach_get("vertices", t)
-            tris.append(t.reshape(-1, 3) + int(off))
-        return BVHTree.FromPolygons(self.vw.tolist(), np.concatenate(tris).tolist())
+            tris.append(t.reshape(-1, 3).astype(np.int64) + int(off))
+        return np.concatenate(tris)
 
     def raycast(self, origin, direction):
         loc, _normal, _index, _dist = self.bvh.ray_cast(origin, direction)
@@ -311,7 +315,7 @@ class EMILSNB_OT_adjust(bpy.types.Operator):
 class EMILSNB_OT_auto_distance(bpy.types.Operator):
     bl_idname = "emils.normal_brush_auto_distance"
     bl_label = "Auto Blur Distance"
-    bl_description = "Set the blur distance to about 2.5 times the mean edge length of the selected meshes (world space)"
+    bl_description = "Set the blur distance to about 1.5 times the mean edge length of the selected meshes (world space)"
     bl_options = {"REGISTER", "UNDO"}
 
     @classmethod
